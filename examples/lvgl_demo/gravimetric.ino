@@ -49,7 +49,7 @@ constexpr int MAX_SHOT_DURATION_S = 50;
 constexpr int DRIP_DELAY_S        = 3;
 constexpr int N                   = 10; // Samples used for trend line
 
-constexpr int RELAY1           = 46;
+constexpr int RELAY1           = 48;
 constexpr int SHOT_HISTORY_CAP = 1000;
 
 // -----------------------------------------------------------------------------
