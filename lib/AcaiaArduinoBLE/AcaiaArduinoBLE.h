@@ -12,6 +12,7 @@
 #ifndef AcaiaArduinoBLE_h
 #define AcaiaArduinoBLE_h
 
+#define LIBRARY_VERSION        "2.1.2+custom"
 #define WRITE_CHAR_OLD_VERSION "2a80"
 #define READ_CHAR_OLD_VERSION  "2a80"
 #define WRITE_CHAR_NEW_VERSION "49535343-8841-43f4-a8d4-ecbe34729bb3"
@@ -19,6 +20,7 @@
 #define WRITE_CHAR_GENERIC     "ffe1"
 #define READ_CHAR_GENERIC      "ffe1"
 #define HEARTBEAT_PERIOD_MS     2750
+#define MAX_PACKET_PERIOD_MS    5000
 
 #include "Arduino.h"
 #include <ArduinoBLE.h>
@@ -56,6 +58,8 @@ class AcaiaArduinoBLE{
         bool                _connected;
         scale_type          _type;
         int                 _currentBattery;
+        long                _packetPeriod;
+        long                _lastPacket;
 };
 
 #endif
