@@ -1,95 +1,281 @@
-<h1 align = "center">🌟T-Display-S3-Long🌟</h1> 
+# Gravimetric Shots
 
-## 1️⃣Product
+**BLE-Connected Gravimetric Espresso Scale Controller**
 
-| Product(PinMap)        | SOC        | Flash | PSRAM    | Resolution |
-| ---------------------- | ---------- | ----- | -------- | ---------- |
-| [T-Display-S3-Long][1] | ESP32-S3R8 | 16MB  | 8MB(OPI) | 180x640    |
+A smart espresso shot controller that connects to Acaia scales via Bluetooth, monitors extraction weight in real-time, and automatically controls solenoid valves for precise shot stopping. Built for the LilyGO T-Display-S3-Long hardware platform.
 
-| Current consumption    | Working current             | sleep current | sleep mode  |
-| ---------------------- | --------------------------- | ------------- | ----------- |
-| [T-Display-S3-Long][1] | (240MHz) WiFi On 90~350+ mA | About 1.1mA   | gpio wakeup |
+![Hardware](images/ArduinoIDE.jpg)
 
-[1]:https://www.lilygo.cc/products/t-display-s3-long
+---
 
+## Features
 
-## 2️⃣Examples
+### 🎯 Core Functionality
+- **BLE Scale Integration**: Connects to Acaia scales (Lunar, Pearl S, Pyxis) via Bluetooth Low Energy
+- **Real-time Monitoring**: Live weight tracking and shot timer display
+- **Predictive Control**: Linear regression algorithm predicts shot endpoint for automated stopping
+- **Relay Output**: GPIO 48 controls solenoid valve for precise flow control
+- **Drip Compensation**: 3-second delay accounts for post-shot dripping
 
-```txt
-examples/
-├── Factory                 # Factory example
-├── tft                     # Tft example
-├── touch                   # Touchpad example
-├── QWIIC_Sensor            # QWIIC Wire example
-├── GFX_AXS15231B_Image       # Screen and touch test example
-└── lvgl_demo               # LVGL examples  
+### 🖥️ User Interface
+- **Touch-based LVGL UI**: Interactive controls on 180×640 portrait display
+- **Weight Target Setting**: Touch controls to adjust target weight (0-100g)
+- **Visual Feedback**: Real-time weight, timer, and status displays
+- **Brightness Control**: Adjustable backlight with persistent storage
+
+### 📊 Advanced Features
+- **Shot History**: Tracks up to 1000 data points per shot
+- **Trend Analysis**: Uses 10-sample moving window for shot prediction
+- **Flush Mode**: Dedicated 5-second flush cycle support
+- **Preferences Storage**: Saves target weight, offset, and settings to flash
+
+---
+
+## Hardware
+
+**Required:** [LilyGO T-Display-S3-Long](https://www.lilygo.cc/products/t-display-s3-long)
+
+| Component | Specification |
+|-----------|--------------|
+| **MCU** | ESP32-S3R8 (Dual-core Xtensa @ 240MHz) |
+| **Flash** | 16MB |
+| **PSRAM** | 8MB (Octal SPI) |
+| **Display** | 180×640 QSPI TFT (AXS15231B driver) |
+| **Touch** | Capacitive touch panel (I2C) |
+| **Power** | USB-C, Battery support with charging |
+| **GPIO** | Relay output on GPIO 48 |
+
+### Pin Configuration
+- **Display QSPI**: CS=12, SCK=17, D0-D3=13,18,21,14, RST=16, BL=1
+- **Touch I2C**: SDA=15, SCL=10, INT=11, RST=16
+- **Relay Output**: GPIO 48 (5V tolerant, suitable for relay/SSR)
+- **Battery Voltage**: GPIO 8 (ADC)
+
+---
+
+## Quick Start
+
+### Prerequisites
+- [Visual Studio Code](https://code.visualstudio.com/)
+- [PlatformIO IDE extension](https://platformio.org/install/ide?install=vscode)
+- Acaia scale (Lunar, Pearl S, or Pyxis recommended)
+
+### Installation
+
+1. **Clone Repository**
+   ```bash
+   git clone https://github.com/SongKeat2901/T-Display-S3-Long.git
+   cd T-Display-S3-Long
+   ```
+
+2. **Open in PlatformIO**
+   - Open folder in VS Code
+   - PlatformIO will automatically install dependencies:
+     - ArduinoBLE v1.4.1
+     - LVGL v8.3.0
+     - Custom AcaiaArduinoBLE (included)
+
+3. **Build & Upload**
+   ```bash
+   pio run --target upload
+   ```
+   Or use the PlatformIO toolbar in VS Code.
+
+4. **Upload Mode** (if USB port not detected)
+   - Press and hold **BOOT** button
+   - Press **RST** button (while holding BOOT)
+   - Release **RST** button
+   - Release **BOOT** button
+   - Upload firmware
+
+---
+
+## Usage
+
+### First Boot
+1. Power on the device
+2. Scale will automatically scan for nearby Acaia scales
+3. Once connected, "Connected" status will appear
+
+### Pulling a Shot
+1. **Set Target Weight**: Touch the target weight display to adjust (±1g increments)
+2. **Tare Scale**: Press the scale's tare button or use the Flush button (long press)
+3. **Start Shot**: Press the **Start** button when ready
+   - Relay activates (solenoid opens)
+   - Weight and timer display in real-time
+   - Predictive algorithm monitors flow rate
+4. **Auto-Stop**: When predicted endpoint reached:
+   - Relay deactivates (solenoid closes)
+   - 3-second drip delay countdown begins
+   - Final weight displayed
+
+### Flush Mode
+- **Long-press Flush button** (>50ms to debounce)
+- 5-second flush cycle runs
+- Cannot flush during active shot
+
+### Settings Persistence
+- Target weight, offset, and brightness are saved to flash memory
+- Restored automatically on reboot
+
+---
+
+## Configuration
+
+### Weight Settings
+- **Target Range**: 0-100g (adjustable in 1g increments)
+- **Offset Calibration**: Automatically stored when taring
+- **Max Offset**: ±5g safety limit
+
+### Shot Parameters
+```cpp
+constexpr int MIN_SHOT_DURATION_S = 5;   // Minimum shot time
+constexpr int MAX_SHOT_DURATION_S = 50;  // Maximum shot time
+constexpr int DRIP_DELAY_S = 3;          // Post-shot drip delay
+constexpr int N = 10;                     // Trend analysis samples
 ```
 
-## 3️⃣ PlatformIO Quick Start (Recommended)
+### Debug Mode
+Uncomment in `GravimetricShots.ino`:
+```cpp
+#define ENABLE_DEBUG_LOG 1
+```
+View logs via Serial Monitor @ 115200 baud.
 
-1. Install [Visual Studio Code](https://code.visualstudio.com/) and [Python](https://www.python.org/)
-2. Search for the `PlatformIO` plugin in the `VisualStudioCode` extension and install it.
-3. After the installation is complete, you need to restart `VisualStudioCode`
-4. After restarting `VisualStudioCode`, select `File` in the upper left corner of `VisualStudioCode` -> `Open Folder` -> select the `T-Display-S3-Long` directory
-5. Wait for the installation of third-party dependent libraries to complete
-6. Click on the `platformio.ini` file, and in the `platformio` column
-7. Uncomment one of the lines `src_dir = xxxx` to make sure only one line works
-8. Click the (✔) symbol in the lower left corner to compile
-9. Connect the board to the computer USB
-10. Click (→) to upload firmware
-11. Click (plug symbol) to monitor serial output
-12. If it cannot be written, or the USB device keeps flashing, please check the **FAQ** below
+---
 
-## 4️⃣ Arduino IDE Quick Start
+## Library Dependencies
 
-* It is recommended to use platformio without cumbersome steps
+### Git-Managed (Auto-Downloaded)
+- **ArduinoBLE** v1.4.1 - Arduino BLE library
+- **LVGL** v8.3.0 - Graphics library (config: `lib/lv_conf.h`)
 
-1. Install [Arduino IDE](https://www.arduino.cc/en/software)
-2. Download or clone project `T-Display-S3-Long`
-3. Copy all the files in `T-Display-S3-Long/lib` and paste them into Arduion library folder(e.g. C:\Users\YourName\Documents\Arduino\libraries).
-4. Open Arduino IDE, select the `examples\xxx` example of project `T-Display-S3-Long` throught `"File->Open"`.
-5. Configuration of board is as follows:
+### Custom (Included in Repo)
+- **AcaiaArduinoBLE** v2.1.2+ - Custom-modified for reliability
+  - Based on [tatemazer/AcaiaArduinoBLE](https://github.com/tatemazer/AcaiaArduinoBLE)
+  - Enhanced with personal findings and improvements
+- **UI Library** - Custom LVGL UI components (`lib/ui/`)
 
-![setting](images/ArduinoIDE.jpg)
+---
 
-6. Select `Port`
-7. Click `upload` , Wait for compilation and writing to complete
-8. If it cannot be written, or the USB device keeps flashing, please check the **FAQ** below
+## Development
 
-# 5️⃣ ESP32 basic examples
+### Project Structure
+```
+T-Display-S3-Long/
+├── src/
+│   ├── GravimetricShots.ino    # Main application
+│   ├── AXS15231B.cpp/.h        # Display driver
+│   ├── pins_config.h            # Hardware pin definitions
+│   └── src/                     # UI assets (test images)
+├── lib/
+│   ├── AcaiaArduinoBLE/        # Custom BLE library
+│   ├── ui/                      # LVGL UI components
+│   └── lv_conf.h                # LVGL configuration
+├── board/
+│   └── T-Display-Long.json     # PlatformIO board definition
+├── platformio.ini               # Build configuration
+└── README.md
+```
 
-* [BLE Examples](https://github.com/espressif/arduino-esp32/tree/master/libraries/BLE)
-* [WiFi Examples](https://github.com/espressif/arduino-esp32/tree/master/libraries/WiFi)
-* [SPIFFS Examples](https://github.com/espressif/arduino-esp32/tree/master/libraries/SPIFFS)
-* [FFat Examples](https://github.com/espressif/arduino-esp32/tree/master/libraries/FFat)
-* For more examples of esp32 chip functions, please refer to [arduino-esp32-libraries](https://github.com/espressif/arduino-esp32/tree/master/libraries)
+### Building
+```bash
+# Clean build
+pio run --target clean
 
-# 6️⃣ FAQ
+# Build only
+pio run
 
-1. The board uses USB as the JTAG upload port. When printing serial port information on USB_CDC_ON_BOOT configuration needs to be turned on.
-If the port cannot be found when uploading the program or the USB has been used for other functions, the port does not appear.
-Please enter the upload mode manually.
-   1. Connect the board via the USB cable
-   2. Press and hold the BOOT button , While still pressing the BOOT button, press RST
-   3. Release the RST
-   4. Release the BOOT button
-   5. Upload sketch
+# Upload
+pio run --target upload
 
-2. If the above is invalid, burn the [binary file](./firmware/README.MD)  to check whether the hardware is normal
-3. The OTG external power supply function requires turning on the PMU OTG enablement ,If the USB input is connected and the OTG is set to output, the battery will not be charged.
-   ```c
-         PMU.enableOTG();  //Enable OTG Power output
-         PMU.disableOTG(); //Disable OTG Power output
-   ```
-4. Turning the physical switch to OFF will completely disconnect the battery from the motherboard. When charging is required, turn the switch to ON.
-5. When the battery is not connected and the USB is plugged in, the board's LED status indicator light will flash. You can use `PMU.disableStatLed();` to turn off the indicator light, but this means that if the battery is connected for charging, the LED light will also be disabled. If you need to enable the charging status indicator, please call `PMU.enableStatLed();`
+# Monitor serial
+pio device monitor --baud 115200
+```
 
+### Multi-Computer Workflow
+Libraries are managed via Git references - simply clone and build:
+```bash
+git clone <your-fork>
+pio run
+```
+PlatformIO automatically downloads ArduinoBLE and LVGL.
 
-# 7️⃣ Depends on required libraries
+---
 
+## Troubleshooting
 
-**Do not upgrade the LVGL version, the lvgl software rotation has been forced to open.**
+### Scale Won't Connect
+- Ensure scale is powered on and in range
+- Try power-cycling both devices
+- Check that scale isn't connected to another device
+- Some scales require manual pairing mode
 
-* [lvgl 8.3.0](https://github.com/lvgl/lvgl)
-* [XPowersLib](https://github.com/lewisxhe/XPowersLib)
+### Upload Fails
+- Use manual upload mode (see Installation step 4)
+- Check USB cable (data cable required, not charge-only)
+- Verify correct COM port selected
 
+### Display Issues
+- **Display corruption**: Reduce SPI frequency in `pins_config.h`
+- **Touch not responding**: Check I2C connections and touch calibration
+
+### Build Errors
+```bash
+# Clear PlatformIO cache
+rm -rf .pio/
+
+# Reinstall dependencies
+pio lib install
+```
+
+---
+
+## Hardware Attribution
+
+This project is built for the **LilyGO T-Display-S3-Long** development board:
+- **Manufacturer**: [LilyGO](https://www.lilygo.cc/)
+- **Original Repo**: [Xinyuan-LilyGO/T-Display-S3-Long](https://github.com/Xinyuan-LilyGO/T-Display-S3-Long)
+- **Product Page**: https://www.lilygo.cc/products/t-display-s3-long
+
+Display driver (AXS15231B) adapted from LilyGO's examples.
+
+---
+
+## License
+
+MIT License - See LICENSE file for details.
+
+**Third-Party Licenses:**
+- LVGL: MIT License
+- ArduinoBLE: LGPL v2.1
+- AcaiaArduinoBLE: Public Domain (original by Tate Mazer)
+
+---
+
+## Contributing
+
+Contributions welcome! Please:
+1. Fork the repository
+2. Create a feature branch
+3. Test thoroughly with hardware
+4. Submit pull request with detailed description
+
+---
+
+## Acknowledgments
+
+- **LilyGO** - Hardware platform and display driver examples
+- **Tate Mazer** - Original AcaiaArduinoBLE library
+- **LVGL Community** - Graphics library and examples
+- **Arduino/Espressif** - ESP32 framework and BLE support
+
+---
+
+## Contact
+
+**Author**: SongKeat
+**Project**: Gravimetric Shots
+**Repository**: https://github.com/SongKeat2901/T-Display-S3-Long
+
+For hardware questions, refer to [LilyGO's documentation](https://github.com/Xinyuan-LilyGO/T-Display-S3-Long).
