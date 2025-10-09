@@ -33,11 +33,17 @@ AcaiaArduinoBLE::AcaiaArduinoBLE()
 {
     _currentWeight = 999;
     _connected = false;
+    _packetPeriod = 0;
 }
 
 bool AcaiaArduinoBLE::init(String mac)
 {
+    // Serial.print("AcaiaArduinoBLE Library v");
+    // Serial.print(LIBRARY_VERSION);
+    // Serial.println(" initializing...");
+
     unsigned long start = millis();
+    _lastPacket = 0;
 
     if (mac == "")
     {
@@ -143,6 +149,7 @@ bool AcaiaArduinoBLE::init(String mac)
                 return false;
             }
             _connected = true;
+            _packetPeriod = 0;
             return true;
         }
         unsigned long currentMillis = millis();
@@ -241,7 +248,7 @@ float AcaiaArduinoBLE::getWeight()
 
 bool AcaiaArduinoBLE::heartbeatRequired()
 {
-    if (_type == OLD || NEW)
+    if (_type == OLD || _type == NEW)
     {
         return (millis() - _lastHeartBeat) > HEARTBEAT_PERIOD_MS;
     }
@@ -258,6 +265,15 @@ bool AcaiaArduinoBLE::isConnected()
 
 bool AcaiaArduinoBLE::newWeightAvailable()
 {
+    // Check for connection timeout
+    if (_lastPacket && millis() - _lastPacket > MAX_PACKET_PERIOD_MS)
+    {
+        Serial.println("Connection timeout - no packets received!");
+        _connected = false;
+        BLE.disconnect();
+        return false;
+    }
+
     byte input[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     // input[2] == 12 weight message type && input[4] == 5 is to confirm got weight package
     if (NEW == _type && _read.valueUpdated() && _read.readValue(input, 13) && input[2] == 0x0C && input[4] == 0x05)
@@ -267,6 +283,13 @@ bool AcaiaArduinoBLE::newWeightAvailable()
         //  get sign byte (10)
         _currentWeight = (((input[6] & 0xff) << 8) + (input[5] & 0xff)) / pow(10, input[9]) * ((input[10] & 0x02) ? -1 : 1);
 
+        // Track packet timing
+        if (_lastPacket)
+        {
+            _packetPeriod = millis() - _lastPacket;
+        }
+        _lastPacket = millis();
+
         return true;
     }
     else if (OLD == _type && _read.valueUpdated() && _read.valueLength() == 10 && _read.readValue(input, 10))
@@ -275,6 +298,14 @@ bool AcaiaArduinoBLE::newWeightAvailable()
         //  apply scaling based on the unit byte (6)
         //  get sign byte (7)
         _currentWeight = (((input[3] & 0xff) << 8) + (input[2] & 0xff)) / pow(10, input[6]) * ((input[7] & 0x02) ? -1 : 1);
+
+        // Track packet timing
+        if (_lastPacket)
+        {
+            _packetPeriod = millis() - _lastPacket;
+        }
+        _lastPacket = millis();
+
         return true;
     }
     else if (GENERIC == _type && _read.valueUpdated() && _read.readValue(input, 13))
@@ -282,6 +313,14 @@ bool AcaiaArduinoBLE::newWeightAvailable()
         // Grab weight bytes (3-8),
         //  get sign byte (2)
         _currentWeight = (input[2] == 0x2B ? 1 : -1) * ((input[3] - 0x30) * 1000 + (input[4] - 0x30) * 100 + (input[5] - 0x30) * 10 + (input[6] - 0x30) * 1 + (input[7] - 0x30) * 0.1 + (input[8] - 0x30) * 0.01);
+
+        // Track packet timing
+        if (_lastPacket)
+        {
+            _packetPeriod = millis() - _lastPacket;
+        }
+        _lastPacket = millis();
+
         return true;
     }
     else
