@@ -28,6 +28,7 @@
 #include <Wire.h>
 #include <ui.h>
 #include <AcaiaArduinoBLE.h>
+#include "esp_task_wdt.h" // Task watchdog for auto-recovery from hangs
 #include <Preferences.h>
 #include <cstring>
 
@@ -88,6 +89,16 @@ bool firstBoot            = true;
 int brightness            = 0;
 float previousTimerValue  = 0.0f;
 
+// Shot end reason tracking for debugging and user feedback
+enum ShotEndReason {
+  WEIGHT_ACHIEVED,    // Target weight reached
+  TIME_EXCEEDED,      // Maximum shot duration exceeded
+  BUTTON_PRESSED,     // User manually stopped shot
+  SCALE_DISCONNECTED, // Lost connection to scale
+  USER_STOPPED,       // Generic user stop
+  UNDEFINED           // Not yet determined
+};
+
 struct Shot
 {
   float start_timestamp_s = 0.0f;
@@ -98,6 +109,7 @@ struct Shot
   float time_s[SHOT_HISTORY_CAP] = {};
   int   datapoints = 0;
   bool  brewing    = false;
+  ShotEndReason endReason = UNDEFINED;
 };
 
 Shot shot;
@@ -114,7 +126,7 @@ unsigned long lastPrintTimeFlushing = 0;
 const unsigned long flushDuration   = 5000; // ms
 bool isFlushing                     = false;
 
-constexpr uint32_t HUMAN_TOUCH_MIN_MS = 50;
+constexpr uint32_t HUMAN_TOUCH_MIN_MS = 100; // Debounce time - prevents accidental double-clicks
 
 Preferences preferences;
 const char *WEIGHT_KEY     = "weight";
@@ -137,9 +149,9 @@ bool hasShownNoScaleMessage  = false;
 constexpr uint32_t SCALE_INIT_RETRY_MS = 2000;
 constexpr uint32_t FLUSH_STATUS_HOLD_MS = 2000;
 uint32_t lastScaleInitAttempt          = 0;
-String pendingScaleStatus;
+char pendingScaleStatus[64] = {0};  // Fixed buffer - eliminates heap fragmentation
 bool hasPendingScaleStatus = false;
-String currentStatusText;
+char currentStatusText[64] = {0};   // Fixed buffer - eliminates heap fragmentation
 bool flushMessageActive    = false;
 uint32_t flushMessageHoldUntil = 0;
 bool relayState = false;
@@ -163,18 +175,20 @@ lv_obj_t *ui_cartext = nullptr;
 
 static inline void setStatusLabels(const char *text)
 {
-  if (currentStatusText == text)
+  if (strcmp(currentStatusText, text) == 0)  // Fixed: proper string comparison
     return;
   lv_label_set_text(ui_SerialLabel, text);
   lv_label_set_text(ui_SerialLabel1, text);
-  currentStatusText = text;
+  strncpy(currentStatusText, text, sizeof(currentStatusText) - 1);  // Fixed: safe string copy
+  currentStatusText[sizeof(currentStatusText) - 1] = '\0';  // Ensure null termination
 }
 
 static inline void queueScaleStatus(const char *text)
 {
   if (isFlushing)
   {
-    pendingScaleStatus   = text;
+    strncpy(pendingScaleStatus, text, sizeof(pendingScaleStatus) - 1);  // Fixed: safe string copy
+    pendingScaleStatus[sizeof(pendingScaleStatus) - 1] = '\0';  // Ensure null termination
     hasPendingScaleStatus = true;
   }
   else
@@ -249,18 +263,38 @@ static void setBrewingState(bool brewing)
   }
 }
 
-static void stopBrew(bool setDefaultStatus)
+static void stopBrew(bool setDefaultStatus, ShotEndReason reason = USER_STOPPED)
 {
   bool wasBrewing = shot.brewing;
 
   shot.brewing = false;
   isFlushing   = false;
+  shot.endReason = reason;
 
   setBrewingState(false);
 
   if (setDefaultStatus && wasBrewing)
   {
-    setStatusLabels("Shot ended");
+    // Display appropriate message based on end reason
+    switch(reason) {
+      case WEIGHT_ACHIEVED:
+        setStatusLabels("Shot ended - Weight achieved");
+        break;
+      case TIME_EXCEEDED:
+        setStatusLabels("Shot ended - Max time");
+        break;
+      case BUTTON_PRESSED:
+        setStatusLabels("Shot ended - Button pressed");
+        break;
+      case SCALE_DISCONNECTED:
+        setStatusLabels("Shot ended - Scale disconnected");
+        break;
+      case USER_STOPPED:
+      case UNDEFINED:
+      default:
+        setStatusLabels("Shot ended");
+        break;
+    }
   }
 }
 
@@ -302,7 +336,21 @@ static void calculateEndTime(Shot *s)
   float meanY = sumY / N;
   float b = meanY - m * meanX;
 
-  s->expected_end_s = (goalWeight - weightOffset - b) / m;
+  // Handle negative or near-zero slope - prevents infinite/absurd predictions
+  if (m < 0.001f)
+  {
+    s->expected_end_s = MAX_SHOT_DURATION_S;
+    return;
+  }
+
+  // Calculate expected end time
+  float expected = (goalWeight - weightOffset - b) / m;
+
+  // Clamp to reasonable bounds (prevents UI showing nonsensical predictions)
+  if (expected < MIN_SHOT_DURATION_S) expected = MIN_SHOT_DURATION_S;
+  if (expected > MAX_SHOT_DURATION_S) expected = MAX_SHOT_DURATION_S;
+
+  s->expected_end_s = expected;
 }
 
 static void enforceRelayState()
@@ -407,17 +455,18 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
         finalY = lastPointY;
       }
 
-      if (deltaX > 24)
+      if (deltaX > 50)  // Increased from 24 for slider responsiveness
       {
         finalX = lastPointX;
       }
 
-      if (deltaY > 32)
+      if (deltaY > 60)  // Increased from 32 for slider responsiveness
       {
         finalY = lastPointY;
       }
     }
 
+    // 2-sample averaging filter for touch stability
     historyX[historyWriteIndex] = finalX;
     historyY[historyWriteIndex] = finalY;
     historyWriteIndex           = (historyWriteIndex + 1) % filterDepth;
@@ -518,7 +567,7 @@ void ui_event_StopButton(lv_event_t *e)
   if (event_code == LV_EVENT_CLICKED && (millis() - pressedAt) >= HUMAN_TOUCH_MIN_MS)
   {
     setStatusLabels("Stop Button Pressed");
-    stopBrew(false);
+    stopBrew(false, BUTTON_PRESSED);
   }
 }
 
@@ -559,7 +608,8 @@ void ui_event_PresetWeightSlight(lv_event_t *e)
   {
     _ui_slider_set_text_value(ui_PresetWeightLabel, target, "", " g");
     int PresetWeightValue = lv_slider_get_value(target);
-    saveWeight(PresetWeightValue);
+    goalWeight = PresetWeightValue;  // Update RAM variable for immediate effect
+    saveWeight(PresetWeightValue);   // Save to Flash for persistence across reboots
     _ui_slider_set_text_value(ui_SerialLabel1, target, "Preset Weight Value Set @ ", " g");
   }
 }
@@ -737,7 +787,7 @@ void checkScaleStatus()
 
     if (shot.brewing)
     {
-      stopBrew(false);
+      stopBrew(false, SCALE_DISCONNECTED);
     }
   }
   else
@@ -761,7 +811,7 @@ void checkScaleStatus()
   {
     if (!flushMessageActive || millis() >= flushMessageHoldUntil)
     {
-      setStatusLabels(pendingScaleStatus.c_str());
+      setStatusLabels(pendingScaleStatus);  // Fixed: already char array, no .c_str() needed
       hasPendingScaleStatus = false;
       flushMessageActive    = false;
     }
@@ -784,9 +834,10 @@ static void handleFlushingCycle()
   {
     lastPrintTimeFlushing = now;
 
-    if (!hasPendingScaleStatus && currentStatusText.length() > 0)
+    if (!hasPendingScaleStatus && strlen(currentStatusText) > 0)  // Fixed: use strlen() for char array
     {
-      pendingScaleStatus    = currentStatusText;
+      strncpy(pendingScaleStatus, currentStatusText, sizeof(pendingScaleStatus) - 1);  // Fixed: safe string copy
+      pendingScaleStatus[sizeof(pendingScaleStatus) - 1] = '\0';  // Ensure null termination
       hasPendingScaleStatus = true;
     }
 
@@ -794,8 +845,9 @@ static void handleFlushingCycle()
     DEBUG_PRINT(remaining / 1000);
     DEBUG_PRINTLN(" seconds remaining");
 
-    const String labelText = "Flushing... " + String(remaining / 1000) + " seconds remaining";
-    setStatusLabels(labelText.c_str());
+    char labelBuf[48];
+    snprintf(labelBuf, sizeof(labelBuf), "Flushing... %lu seconds remaining", remaining / 1000);
+    setStatusLabels(labelBuf);
   }
 
   if (elapsed >= flushDuration)
@@ -817,7 +869,7 @@ static void processPendingStatusQueue()
 
   if (!flushMessageActive || millis() >= flushMessageHoldUntil)
   {
-    setStatusLabels(pendingScaleStatus.c_str());
+    setStatusLabels(pendingScaleStatus);  // Fixed: already char array, no .c_str() needed
     hasPendingScaleStatus = false;
     flushMessageActive    = false;
   }
@@ -844,9 +896,14 @@ static void updateScaleReadings()
 
   if (shot.datapoints >= SHOT_HISTORY_CAP)
   {
-    std::memmove(shot.time_s,   shot.time_s + 1,   (SHOT_HISTORY_CAP - 1) * sizeof(float));
-    std::memmove(shot.weight,   shot.weight + 1,   (SHOT_HISTORY_CAP - 1) * sizeof(float));
+    // Clamp FIRST to prevent out-of-bounds access if datapoints > SHOT_HISTORY_CAP
     shot.datapoints = SHOT_HISTORY_CAP - 1;
+
+    // Now safe to shift array (discard oldest datapoint)
+    std::memmove(shot.time_s,   shot.time_s + 1,   shot.datapoints * sizeof(float));
+    std::memmove(shot.weight,   shot.weight + 1,   shot.datapoints * sizeof(float));
+
+    DEBUG_PRINTLN("Shot history buffer full, oldest datapoint discarded");
   }
 
   const float nowSeconds = seconds_f() - shot.start_timestamp_s;
@@ -869,8 +926,9 @@ static void updateScaleReadings()
   DEBUG_PRINT(" ");
   DEBUG_PRINT(shot.expected_end_s);
 
-  const String labelText = "Expected end time @ " + String(shot.expected_end_s) + " s";
-  setStatusLabels(labelText.c_str());
+  char labelBuf[40];
+  snprintf(labelBuf, sizeof(labelBuf), "Expected end time @ %.1f s", shot.expected_end_s);
+  setStatusLabels(labelBuf);
 
   DEBUG_PRINTLN("");
 }
@@ -891,14 +949,14 @@ static void handleShotWatchdogs()
   {
     DEBUG_PRINTLN("Max brew duration reached");
     setStatusLabels("Max brew duration reached");
-    stopBrew(false);
+    stopBrew(false, TIME_EXCEEDED);
   }
 
   if (shot.brewing && shot.shotTimer >= shot.expected_end_s && shot.shotTimer > MIN_SHOT_DURATION_S)
   {
     DEBUG_PRINTLN("weight achieved");
     setStatusLabels("Weight achieved");
-    stopBrew(false);
+    stopBrew(false, WEIGHT_ACHIEVED);
   }
 
   if (shot.start_timestamp_s && shot.end_s && currentWeight >= (goalWeight - weightOffset) &&
@@ -956,6 +1014,11 @@ void setup()
 
   DEBUG_PRINTLN("Serial Started");
 
+  // Initialize task watchdog (10 second timeout) - auto-reboot on hang
+  esp_task_wdt_init(10, true);  // 10s timeout, panic & reboot on trigger
+  esp_task_wdt_add(NULL);       // Add current task to watchdog
+  DEBUG_PRINTLN("Task watchdog enabled (10s timeout)");
+
   preferences.begin("myApp", false);                       // Open the preferences with a namespace and read-only flag
   brightness = preferences.getInt(BRIGHTNESS_KEY, 0);      // Read the brightness value from preferences
   goalWeight = preferences.getInt(WEIGHT_KEY, 0);          // Read the target weight value from preferences
@@ -972,19 +1035,25 @@ void setup()
   if ((goalWeight < 10) || (goalWeight > 200)) // If preferences isn't initialized and has an unreasonable weight/offset, default to 36g/1.5g
   {
     goalWeight = 36;
-    DEBUG_PRINTLN("Goal Weight set to: " + String(goalWeight) + " g");
+    char debugBuf[64];
+    snprintf(debugBuf, sizeof(debugBuf), "Goal Weight set to: %d g", goalWeight);
+    DEBUG_PRINTLN(debugBuf);
   }
 
   if (weightOffset > MAX_OFFSET)
   {
     weightOffset = 1.5;
-    DEBUG_PRINTLN("Offset set to: " + String(weightOffset) + " g");
+    char debugBuf[64];
+    snprintf(debugBuf, sizeof(debugBuf), "Offset set to: %.1f g", weightOffset);
+    DEBUG_PRINTLN(debugBuf);
   }
 
   if ((brightness < 0) || (brightness > 100)) // If preferences isn't initialized set brightness to 50%
   {
     brightness = 50;
-    DEBUG_PRINTLN("Backlight set to: Default @ " + String(brightness) + " %");
+    char debugBuf[64];
+    snprintf(debugBuf, sizeof(debugBuf), "Backlight set to: Default @ %d %%", brightness);
+    DEBUG_PRINTLN(debugBuf);
   }
 
   // initialize the GPIO hardware
@@ -1054,7 +1123,7 @@ void setup()
     disp_drv.draw_buf = &draw_buf;
     disp_drv.sw_rotate = 1; // If you turn on software rotation, Do not update or replace LVGL
     disp_drv.rotated = LV_DISP_ROT_270;
-    disp_drv.full_refresh = 1; // full_refresh must be 1
+    disp_drv.full_refresh = 1; // full_refresh must be 1 (partial refresh causes smearing)
     lv_disp_drv_register(&disp_drv);
 
     static lv_indev_drv_t indev_drv;
@@ -1092,6 +1161,8 @@ void setup()
 
 void loop()
 {
+  esp_task_wdt_reset();  // Reset watchdog at start of every loop iteration
+
   LVGLTimerHandlerRoutine();
   checkScaleStatus();
   checkHeartBreat();

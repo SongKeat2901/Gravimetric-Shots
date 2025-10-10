@@ -128,7 +128,7 @@ lv_obj_clear_flag( ui_ScaleImage1, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
 lv_img_set_zoom(ui_ScaleImage1,150);
 
 ui_PresetWeightSlight = lv_slider_create(ui_ScaleSlider);
-lv_slider_set_range(ui_PresetWeightSlight, 0,50);
+lv_slider_set_range(ui_PresetWeightSlight, 0, 80);
 lv_slider_set_value( ui_PresetWeightSlight, 36, LV_ANIM_OFF);
 if (lv_slider_get_mode(ui_PresetWeightSlight)==LV_SLIDER_MODE_RANGE ) lv_slider_set_left_value( ui_PresetWeightSlight, 0, LV_ANIM_OFF);
 lv_obj_set_width( ui_PresetWeightSlight, 350);
