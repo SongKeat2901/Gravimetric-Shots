@@ -186,7 +186,7 @@ lv_obj_set_align( ui_Container13, LV_ALIGN_CENTER );
 lv_obj_clear_flag( ui_Container13, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE );    /// Flags
 
 ui_SerialImage1 = lv_img_create(ui_Container10);
-lv_img_set_src(ui_SerialImage1, &ui_img_1495795081);
+lv_img_set_src(ui_SerialImage1, &ui_img_arrow_png);
 lv_obj_set_width( ui_SerialImage1, 24);
 lv_obj_set_height( ui_SerialImage1, 24);
 lv_obj_set_align( ui_SerialImage1, LV_ALIGN_CENTER );
@@ -229,7 +229,7 @@ lv_obj_set_style_bg_opa(ui_ReturnFromSettingButton, 255, LV_PART_MAIN| LV_STATE_
 lv_obj_set_style_bg_img_src( ui_ReturnFromSettingButton, &ui_img_return_png, LV_PART_MAIN | LV_STATE_DEFAULT );
 
 ui_BluetoothImage2 = lv_img_create(ui_SettingScreen);
-lv_img_set_src(ui_BluetoothImage2, &ui_img_420894227);
+lv_img_set_src(ui_BluetoothImage2, &ui_img_bluetooth_png);
 lv_obj_set_width( ui_BluetoothImage2, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_BluetoothImage2, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_BluetoothImage2, -2 );

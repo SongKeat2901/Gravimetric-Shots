@@ -97,21 +97,21 @@ extern lv_obj_t *ui_ReturnFromSettingButton;
 extern lv_obj_t *ui_BluetoothImage2;
 extern lv_obj_t *ui____initial_actions0;
 
-LV_IMG_DECLARE( ui_img_2089747144);   // assets/waterdrops-bold.png
-LV_IMG_DECLARE( ui_img_1544916161);   // assets/coffee-cup-2.png
-LV_IMG_DECLARE( ui_img_515815694);   // assets/cancel-02.png
-LV_IMG_DECLARE( ui_img_timer_png);   // assets/timer.png
-LV_IMG_DECLARE( ui_img_951525100);   // assets/refresh-bold.png
+LV_IMG_DECLARE( ui_img_flush_png);      // assets/waterdrops-bold.png
+LV_IMG_DECLARE( ui_img_coffee_png);     // assets/coffee-cup-2.png
+LV_IMG_DECLARE( ui_img_cancel_png);     // assets/cancel-02.png
+LV_IMG_DECLARE( ui_img_timer_png);      // assets/timer.png
+LV_IMG_DECLARE( ui_img_refresh_png);    // assets/refresh-bold.png
 
-LV_IMG_DECLARE( ui_img_weight_png);   // assets/weight.png
+LV_IMG_DECLARE( ui_img_weight_png);     // assets/weight.png
 
-LV_IMG_DECLARE( ui_img_1495795081);   // assets/alt-arrow-right-linear.png
+LV_IMG_DECLARE( ui_img_arrow_png);      // assets/alt-arrow-right-linear.png
 
-LV_IMG_DECLARE( ui_img_80803761);   // assets/config-coffeescript.png
+LV_IMG_DECLARE( ui_img_config_png);     // assets/config-coffeescript.png
 
-LV_IMG_DECLARE( ui_img_420894227);   // assets/bluetooth-square-linear b.png
+LV_IMG_DECLARE( ui_img_bluetooth_png);  // assets/bluetooth-square-linear b.png
 
-LV_IMG_DECLARE( ui_img_light_png);   // assets/light.png
+LV_IMG_DECLARE( ui_img_light_png);      // assets/light.png
 
 LV_IMG_DECLARE( ui_img_return_png);   // assets/return.png
 
