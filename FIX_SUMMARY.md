@@ -27,7 +27,7 @@ After the September 30, 2025 refactor (commit `b6cecdb`), the device would build
 **Commit b6cecdb** made this change to `platformio.ini`:
 
 ```diff
-[env:lvgl_demo]
+[env:gravimetric_shots]
 extends = env
 -; Using local vendored libraries from lib/ instead of lib_deps
 -lib_deps =
@@ -152,9 +152,9 @@ The code compiled because:
 
 ```ini
 [platformio]
-src_dir = src  ← Changed from examples/lvgl_demo
+src_dir = src  ← Changed from src
 
-[env:lvgl_demo]
+[env:gravimetric_shots]
 extends = env
 lib_deps =  ← EMPTY - uses lib/ folder
 ```
@@ -175,7 +175,7 @@ $ head -3 lib/lv_conf.h
 **Step 3: Restructured Source**
 
 ```
-Old: examples/lvgl_demo/gravimetric.ino
+Old: src/gravimetric.ino
 New: src/GravimetricShots.ino
      src/AXS15231B.{cpp,h}
      src/pins_config.h
@@ -335,7 +335,7 @@ bool AcaiaArduinoBLE::newWeightAvailable() {
 
 ### 3. Code Organization
 
-- Moved from `examples/lvgl_demo/` → `src/`
+- Moved from `src/` → `src/`
 - Added professional header to `GravimetricShots.ino`
 - Copied display driver files to `src/`
 - Updated `platformio.ini` to point to `src/`

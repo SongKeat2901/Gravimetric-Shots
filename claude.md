@@ -19,7 +19,7 @@
 ### ✅ Solution: Reverted to Vendored Libraries
 - Removed Git library dependencies from platformio.ini
 - Kept vendored LVGL v8.3.0-dev (matches lv_conf.h configuration)
-- Moved code from examples/lvgl_demo/ → src/
+- Moved code from src/ → src/
 - Updated src_dir to point to src/
 - **Result:** Display working, all functionality restored ✅
 
@@ -60,7 +60,7 @@
 - Updated description: "Gravimetric Shots - BLE Espresso Scale Controller"
 - Renamed gravimetric.ino → GravimetricShots.ino
 - Added comprehensive project header with authorship
-- Moved src from examples/lvgl_demo to src/
+- Moved src from src to src/
 
 ### ✅ Phase 4: Documentation
 - Completely rewrote README.md
