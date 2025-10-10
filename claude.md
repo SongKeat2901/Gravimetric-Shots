@@ -97,7 +97,6 @@ Gravimetric-Shots/
 │   └── lv_conf.h                # LVGL configuration
 ├── board/
 │   └── T-Display-Long.json     # PlatformIO board definition
-├── examples/lvgl_demo/         # Original examples (reference)
 ├── platformio.ini               # Build configuration
 ├── README.md                    # Project documentation
 └── claude.md                    # This file
