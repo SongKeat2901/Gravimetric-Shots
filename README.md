@@ -1,4 +1,31 @@
-<h1 align = "center">🌟T-Display-S3-Long🌟</h1> 
+<h1 align = "center">🌟T-Display-S3-Long🌟</h1>
+
+## ⚠️ Project Note
+
+**This repository contains Gravimetric Shots - a gravimetric espresso controller based on:**
+
+- **Hardware:** LilyGO T-Display-S3-Long (see below for hardware specs)
+- **BLE Library:** [tatemazer/AcaiaArduinoBLE](https://github.com/tatemazer/AcaiaArduinoBLE) ⭐
+
+### Acknowledgments
+
+**Primary Credit:**
+- **Tate Mazer** - Creator and maintainer of [AcaiaArduinoBLE](https://github.com/tatemazer/AcaiaArduinoBLE)
+  - Supports multiple Acaia scales (Lunar, Pyxis, Pearl S, BooKoo Themis)
+  - Active community support via [Discord](https://discord.gg/NMXb5VYtre)
+  - Regular updates and improvements
+
+**Community Contributors:** Pio Baettig, philgood, Jochen Niebuhr, RP, and Discord community
+
+**Hardware:** LilyGO / Xinyuan-LilyGO for T-Display-S3-Long design
+
+**This Fork:** Adds LVGL integration for embedded touch UI (tested on LM Micra + Acaia Lunar only)
+
+**For general Acaia scale integration, use [Tate's upstream library](https://github.com/tatemazer/AcaiaArduinoBLE)**
+
+**Complete attribution:** See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md)
+
+---
 
 ## 1️⃣Product
 

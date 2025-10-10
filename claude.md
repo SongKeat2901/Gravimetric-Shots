@@ -157,6 +157,73 @@ Gravimetric-Shots/
 
 ---
 
+## 🙏 Acknowledgments & Attributions
+
+### **Based on Excellent Community Work**
+
+This project builds upon **8 years of community reverse engineering**:
+
+```
+h1kari (2015) → bpowers (2016) → AndyZap (2017) → lucapinello (2018) →
+frowin (2020s) → **Tate Mazer (2023-present)** ⭐ ← PRIMARY CREDIT
+```
+
+### **Primary Credit: Tate Mazer**
+
+**This project is based on [tatemazer/AcaiaArduinoBLE](https://github.com/tatemazer/AcaiaArduinoBLE)**
+
+Tate's ongoing work (2023-present):
+- Created and maintains the definitive Arduino/ESP32 Acaia library
+- Supports 5+ scale types (Lunar, Pyxis, Pearl S, BooKoo Themis, etc.)
+- Active development: Regular updates, bug fixes, new features
+- Hardware development: V3.1 PCB for scale integration
+- Community support: Discord server, issue tracking
+- Connection watchdog (v3.1.2-3.1.3)
+- Debug mode for troubleshooting
+
+**Discord:** https://discord.gg/NMXb5VYtre
+
+### **Community Contributors (to Upstream)**
+
+- **Pio Baettig:** Generic scale support, Felicita Arc
+- **philgood:** BooKoo Themis support (#18)
+- **Jochen Niebuhr:** Lunar 2019 contributions
+- **RP:** BooKoo contributions
+- **Discord Community:** Testing, feedback, validation
+
+### **This Fork's Specific Modifications**
+
+**Scope:** Specialized fork for embedded LVGL UI, NOT general improvement
+
+**Testing:** LIMITED - LM Micra + Acaia Lunar only
+
+**What was added:**
+1. **LVGL Integration** - UI timer handling during BLE operations
+2. **Serial.print Fix** - Commented out blocking calls for LVGL compatibility
+3. **Merged Upstream** - Connection watchdog from Tate's v3.1.4
+4. **Issue #7** - Documented ESP32-S3 17-byte packet behavior
+
+**What was NOT tested:**
+- ❌ Other scales (Pyxis, Pearl S, BooKoo Themis)
+- ❌ Other machines (Gaggia, Rancilio, E61, etc.)
+- ❌ Multiple scales
+- ❌ Long-term production use beyond personal setup
+
+### **Important Disclaimer**
+
+**This fork serves ONE specific use case: Embedded LVGL touch UI**
+
+**For general scale integration, use [Tate's upstream library](https://github.com/tatemazer/AcaiaArduinoBLE):**
+- More scales supported ✅
+- Actively maintained ✅
+- Community tested ✅
+- Discord support ✅
+- Broader hardware validation ✅
+
+**See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for complete attribution.**
+
+---
+
 ## 🚀 Next Steps / Future Enhancements
 
 ### Immediate Tasks
@@ -239,10 +306,12 @@ pio run
 ## 📝 Important Notes
 
 ### Custom Library Maintenance
-- **AcaiaArduinoBLE:** Contains your personal modifications
-  - Keep track of what you changed from upstream
-  - Consider documenting custom changes in the library folder
-  - Upstream v3.1.4 available if you want to review updates
+- **AcaiaArduinoBLE:** Contains your personal modifications (v2.1.2+custom)
+  - **Full documentation:** [IMPLEMENTATION_COMPARISON.md](IMPLEMENTATION_COMPARISON.md)
+  - **Changes from upstream:** [lib/AcaiaArduinoBLE/CUSTOM_MODIFICATIONS.md](lib/AcaiaArduinoBLE/CUSTOM_MODIFICATIONS.md)
+  - **Protocol research:** [ACAIA_BLE_PROTOCOL_RESEARCH.md](ACAIA_BLE_PROTOCOL_RESEARCH.md)
+  - Upstream v3.1.4 improvements already merged (Oct 1, 2025)
+  - Your implementation is MORE ROBUST than upstream (see comparison docs)
 
 ### Hardware Attribution
 - This project uses LilyGO T-Display-S3-Long hardware
@@ -286,10 +355,19 @@ gh repo view SongKeat2901/Gravimetric-Shots
 
 ## 📞 Support & Resources
 
-**Repository:** https://github.com/SongKeat2901/Gravimetric-Shots
-**Hardware Docs:** https://github.com/Xinyuan-LilyGO/T-Display-S3-Long
-**PlatformIO:** https://docs.platformio.org
-**LVGL:** https://docs.lvgl.io
+### Project Documentation
+- **Main Repository:** https://github.com/SongKeat2901/Gravimetric-Shots
+- **Protocol Research:** [ACAIA_BLE_PROTOCOL_RESEARCH.md](ACAIA_BLE_PROTOCOL_RESEARCH.md) - 8-year history of reverse engineering
+- **Implementation Analysis:** [IMPLEMENTATION_COMPARISON.md](IMPLEMENTATION_COMPARISON.md) - Why your code is more robust
+- **Custom Modifications:** [lib/AcaiaArduinoBLE/CUSTOM_MODIFICATIONS.md](lib/AcaiaArduinoBLE/CUSTOM_MODIFICATIONS.md) - v2.1.2 vs v3.1.4
+
+### External Resources
+- **Hardware Docs:** https://github.com/Xinyuan-LilyGO/T-Display-S3-Long
+- **PlatformIO:** https://docs.platformio.org
+- **LVGL:** https://docs.lvgl.io
+- **Upstream AcaiaArduinoBLE:** https://github.com/tatemazer/AcaiaArduinoBLE
+- **Your Issue #7:** https://github.com/tatemazer/AcaiaArduinoBLE/issues/7
+- **BLE Reverse Engineering Guide:** https://reverse-engineering-ble-devices.readthedocs.io
 
 ---
 
