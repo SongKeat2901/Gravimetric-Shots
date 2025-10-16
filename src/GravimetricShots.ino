@@ -89,6 +89,28 @@ bool firstBoot            = true;
 int brightness            = 0;
 float previousTimerValue  = 0.0f;
 
+// Timer update tracking for independent 0.1s updates
+unsigned long lastTimerUpdate = 0;
+const unsigned long TIMER_UPDATE_INTERVAL_MS = 100;  // 100ms = 0.1 second
+
+// BLE command sequencer state machine (non-blocking)
+enum BLESequenceState {
+  BLE_IDLE,
+  BLE_SEND_RESET,
+  BLE_WAIT_AFTER_RESET,
+  BLE_SEND_TARE,
+  BLE_WAIT_AFTER_TARE,
+  BLE_SEND_START,
+  BLE_START_SHOT
+};
+
+BLESequenceState bleSequenceState = BLE_IDLE;
+unsigned long bleSequenceTimestamp = 0;
+const unsigned long BLE_COMMAND_DELAY_MS = 100;
+bool bleSequenceInProgress = false;
+
+// Battery request now handled during scale init (in AcaiaArduinoBLE library)
+
 // Shot end reason tracking for debugging and user feedback
 enum ShotEndReason {
   WEIGHT_ACHIEVED,    // Target weight reached
@@ -203,6 +225,162 @@ static float seconds_f()
   return millis() / 1000.0f;
 }
 
+/**
+ * @brief Update display refresh rate based on activity level
+ * @param active_shot true during espresso shots, false when idle
+ *
+ * Dynamically adjusts LVGL refresh timer to optimize performance and power:
+ * - Fast mode (60Hz = 16ms): During shots for smooth weight updates
+ * - Slow mode (30Hz = 33ms): When idle for power savings
+ */
+static void updateDisplayRefreshRate(bool active_shot)
+{
+  lv_disp_t *display = lv_disp_get_default();
+  lv_timer_t *refresh_timer = _lv_disp_get_refr_timer(display);
+
+  if (active_shot)
+  {
+    // Fast refresh during shot (16ms = 60Hz) for smooth weight updates
+    lv_timer_set_period(refresh_timer, 16);
+    DEBUG_PRINTLN("Display: 60Hz (fast mode)");
+  }
+  else
+  {
+    // Normal refresh when idle (33ms = 30Hz) to save CPU/power
+    lv_timer_set_period(refresh_timer, 33);
+    DEBUG_PRINTLN("Display: 30Hz (normal mode)");
+  }
+}
+
+/**
+ * @brief Update shot timer display independently every 0.1 second
+ *
+ * This function runs on its own millis-based schedule, independent of scale
+ * BLE notifications. Ensures smooth timer progression even when scale sends
+ * infrequent weight updates.
+ */
+static void updateShotTimer()
+{
+  if (!shot.brewing)
+    return;
+
+  unsigned long now = millis();
+
+  // Update timer display every 100ms (0.1 second)
+  if (now - lastTimerUpdate >= TIMER_UPDATE_INTERVAL_MS)
+  {
+    shot.shotTimer = seconds_f() - shot.start_timestamp_s;
+
+    char buffer[10];
+    dtostrf(shot.shotTimer, 5, 1, buffer);
+    lv_label_set_text(ui_TimerLabel, buffer);
+
+    lastTimerUpdate = now;
+  }
+}
+
+/**
+ * @brief Non-blocking BLE command sequencer for shot start
+ *
+ * Sequence: resetTimer → [100ms] → tare → [100ms] → startTimer → pump ON
+ * Runs in loop() without blocking. Uses millis-based timing like handleFlushingCycle().
+ */
+static void handleBLESequence()
+{
+  unsigned long now = millis();
+
+  switch (bleSequenceState)
+  {
+    case BLE_IDLE:
+      // Nothing to do - waiting for shot start trigger
+      break;
+
+    case BLE_SEND_RESET:
+      DEBUG_PRINTLN("BLE: Sending RESET");
+      if (!scale.resetTimer())
+      {
+        queueScaleStatus("Scale reset failed");
+        bleSequenceState = BLE_IDLE;
+        bleSequenceInProgress = false;
+        shot.brewing = false;
+        isFlushing = false;
+        return;
+      }
+      bleSequenceTimestamp = now;
+      bleSequenceState = BLE_WAIT_AFTER_RESET;
+      break;
+
+    case BLE_WAIT_AFTER_RESET:
+      // Non-blocking wait for 100ms
+      if (now - bleSequenceTimestamp >= BLE_COMMAND_DELAY_MS)
+      {
+        bleSequenceState = BLE_SEND_TARE;
+      }
+      break;
+
+    case BLE_SEND_TARE:
+      DEBUG_PRINTLN("BLE: Sending TARE");
+      if (!scale.tare())
+      {
+        queueScaleStatus("Scale tare failed");
+        if (scale.isConnected())
+        {
+          scale.stopTimer();
+        }
+        setRelayState(false);
+        bleSequenceState = BLE_IDLE;
+        bleSequenceInProgress = false;
+        shot.brewing = false;
+        isFlushing = false;
+        return;
+      }
+      bleSequenceTimestamp = now;
+      bleSequenceState = BLE_WAIT_AFTER_TARE;
+      break;
+
+    case BLE_WAIT_AFTER_TARE:
+      // Non-blocking wait for 100ms
+      if (now - bleSequenceTimestamp >= BLE_COMMAND_DELAY_MS)
+      {
+        bleSequenceState = BLE_SEND_START;
+      }
+      break;
+
+    case BLE_SEND_START:
+      DEBUG_PRINTLN("BLE: Sending START");
+      if (!scale.startTimer())
+      {
+        queueScaleStatus("Scale timer failed");
+        bleSequenceState = BLE_IDLE;
+        bleSequenceInProgress = false;
+        shot.brewing = false;
+        isFlushing = false;
+        return;
+      }
+      bleSequenceState = BLE_START_SHOT;
+      break;
+
+    case BLE_START_SHOT:
+      // Timer is now running - capture timestamp and turn on pump
+      shot.start_timestamp_s = seconds_f();
+      shot.shotTimer = 0.0f;
+      shot.datapoints = 0;
+      lastTimerUpdate = millis();
+
+      // NOW set shot.brewing to true after all BLE commands succeeded
+      shot.brewing = true;
+      bleSequenceInProgress = false;
+
+      DEBUG_PRINTLN("BLE: Starting shot - turning ON pump");
+      setRelayState(true);              // Turn ON pump (relay)
+      updateDisplayRefreshRate(true);   // 60Hz display mode
+
+      bleSequenceState = BLE_IDLE;
+      DEBUG_PRINTLN("Shot started successfully!");
+      break;
+  }
+}
+
 static void setBrewingState(bool brewing)
 {
   if (brewing)
@@ -222,34 +400,13 @@ static void setBrewingState(bool brewing)
       return;
     }
 
-    DEBUG_PRINTLN("shot started");
-    if (!scale.startTimer())
-    {
-      queueScaleStatus("Scale timer failed");
-      shot.brewing = false;
-      isFlushing   = false;
-      return;
-    }
+    DEBUG_PRINTLN("Shot start requested - triggering BLE sequence");
 
-    if (!scale.tare())
-    {
-      queueScaleStatus("Scale tare failed");
-      if (scale.isConnected())
-      {
-        scale.stopTimer();
-      }
-      setRelayState(false);
-      shot.brewing = false;
-      isFlushing   = false;
-      return;
-    }
-
-    shot.start_timestamp_s = seconds_f();
-    shot.shotTimer         = 0.0f;
-    shot.datapoints        = 0;
-
-    DEBUG_PRINTLN("Weight Timer End");
-    setRelayState(true);
+    // Trigger non-blocking BLE command sequence
+    // Sequence: reset → tare → start → pump ON (handled by handleBLESequence)
+    bleSequenceInProgress = true;
+    bleSequenceState = BLE_SEND_RESET;
+    // Note: shot.brewing will be set to true in BLE_START_SHOT state after commands complete
   }
   else
   {
@@ -260,6 +417,7 @@ static void setBrewingState(bool brewing)
       scale.stopTimer();
     }
     setRelayState(false);
+    updateDisplayRefreshRate(false);  // Switch back to normal refresh (30Hz) when idle
   }
 }
 
@@ -270,8 +428,10 @@ static void stopBrew(bool setDefaultStatus, ShotEndReason reason = USER_STOPPED)
   shot.brewing = false;
   isFlushing   = false;
   shot.endReason = reason;
+  lastTimerUpdate = 0;  // Reset timer update tracking
 
   setBrewingState(false);
+  updateDisplayRefreshRate(false);  // Switch back to normal refresh (30Hz) when stopped
 
   if (setDefaultStatus && wasBrewing)
   {
@@ -646,7 +806,7 @@ void ui_event_TimerResetButton(lv_event_t *e)
   {
     char buffer[5];
     shot.shotTimer = 0;
-    dtostrf(shot.shotTimer, 5, 0, buffer);
+    dtostrf(shot.shotTimer, 5, 1, buffer);
     lv_label_set_text(ui_TimerLabel, buffer);
   }
 }
@@ -708,42 +868,7 @@ void checkHeartBreat()
   }
 }
 
-// Call back for get battery value
-const long intervalBattery = 30000; // 30 seconds
-unsigned long previousMillisBattery = 0;
-
-void getBatteryUpdate()
-{
-  if (!scale.isConnected())
-  {
-    return;
-  }
-  unsigned long currentMillisBattery = millis();
-
-  if (currentMillisBattery - previousMillisBattery >= intervalBattery)
-  {
-    // Save the last time you checked the battery
-    previousMillisBattery = currentMillisBattery;
-    // Check the battery status
-    if (scale.getBattery())
-    {
-      DEBUG_PRINTLN("Sent Get Battery Request Completed");
-    }
-  }
-  if (scale.updateBattery())
-  {
-    DEBUG_PRINT("Current Scale Battery Level @ ");
-    DEBUG_PRINT(scale.batteryValue());
-    DEBUG_PRINT("%");
-    firstBoot = false;
-
-    if (scale.batteryValue() < 10)
-    {
-      BatteryLow = true;
-    }
-  }
-}
-// end call back for get battery value
+// Battery request now handled during scale init in AcaiaArduinoBLE library
 
 void checkScaleStatus()
 {
@@ -915,12 +1040,7 @@ static void updateScaleReadings()
   DEBUG_PRINT(" ");
   DEBUG_PRINT(shot.shotTimer);
 
-  if (shot.shotTimer >= previousTimerValue + 0.01f)
-  {
-    dtostrf(shot.shotTimer, 5, 0, buffer);
-    lv_label_set_text(ui_TimerLabel, buffer);
-    previousTimerValue = shot.shotTimer;
-  }
+  // Timer display now updated independently by updateShotTimer() function
 
   calculateEndTime(&shot);
   DEBUG_PRINT(" ");
@@ -941,6 +1061,7 @@ static void handleShotWatchdogs()
   {
     setRelayState(false);
     previousTimerValue = 0.0f;
+    lastTimerUpdate = 0;
   }
 
   enforceRelayState();
@@ -1083,7 +1204,7 @@ void setup()
   Wire.begin(TOUCH_IICSDA, TOUCH_IICSCL);
 
   pinMode(TFT_BL, OUTPUT);    // initialized TFT Backlight Pin as output
-  digitalWrite(TFT_BL, HIGH); // initialized TFT BL and set to max
+  digitalWrite(TFT_BL, LOW);  // Keep backlight OFF during initialization to prevent noise/garbage display
 
   axs15231_init(); // initialized Screen
 
@@ -1134,6 +1255,14 @@ void setup()
   }
   ui_init(); // initialized LVGL UI intereface
 
+  // Force LVGL to render the first frame before turning on backlight
+  // This prevents showing uninitialized frame buffer (noise/garbage)
+  for (int i = 0; i < 10; i++) {
+    lv_task_handler();  // Process LVGL tasks to render UI
+    delay(5);           // Small delay to allow rendering to complete
+  }
+
+  // NOW turn on backlight - UI is fully rendered and ready
   int LCDBrightness = map(brightness, 0, 100, 70, 256); // brightness value is 0~100% have to map it out to pwm value.
   analogWrite(TFT_BL, LCDBrightness);
 
@@ -1166,10 +1295,10 @@ void loop()
   LVGLTimerHandlerRoutine();
   checkScaleStatus();
   checkHeartBreat();
-  if (firstBoot)
-    getBatteryUpdate();
   handleFlushingCycle();
+  handleBLESequence();    // Non-blocking BLE command sequencer
   updateScaleReadings();
+  updateShotTimer();      // Independent timer update every 0.1s
   handleShotWatchdogs();
   processPendingStatusQueue();
 }

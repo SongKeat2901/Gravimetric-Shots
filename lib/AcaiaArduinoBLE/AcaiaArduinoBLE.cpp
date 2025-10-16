@@ -56,8 +56,12 @@ bool AcaiaArduinoBLE::init(String mac)
         return false;
     }
 
-    do
+    // Scan for scale with timeout (changed from do-while to while for clarity)
+    while (millis() - start < 1000)
     {
+        // Reset watchdog to prevent timeout during long scan
+        esp_task_wdt_reset();
+
         BLEDevice peripheral = BLE.available();
         if (peripheral && isScaleName(peripheral.localName()))
         {
@@ -139,6 +143,11 @@ bool AcaiaArduinoBLE::init(String mac)
                 Serial.println("identify write failed");
                 return false;
             }
+
+            // Request battery BEFORE starting weight notifications to avoid conflicts
+            requestBatterySync();
+
+            // NOW send notification request to start weight updates
             if (_write.writeValue(NOTIFICATION_REQUEST, 14))
             {
                 Serial.println("notification request write successful");
@@ -152,16 +161,15 @@ bool AcaiaArduinoBLE::init(String mac)
             _packetPeriod = 0;
             return true;
         }
+
+        // Keep LVGL responsive during scan
         unsigned long currentMillis = millis();
-        // Check if it's time to update LVGL
         if (currentMillis - lastLvUpdate >= lvUpdateInterval)
         {
-            // Save the last update time
             lastLvUpdate = currentMillis;
             LVGLTimerHandlerRoutine();
         }
-
-    } while (millis() - start < 1000);
+    }
 
     Serial.println("failed to find scale");
     return false;
@@ -169,7 +177,7 @@ bool AcaiaArduinoBLE::init(String mac)
 
 bool AcaiaArduinoBLE::tare()
 {
-    if (_write.writeValue((_type == GENERIC ? TARE_GENERIC : TARE_ACAIA), 20))
+    if (_write.writeValue((_type == GENERIC ? TARE_GENERIC : TARE_ACAIA), (_type == GENERIC ? 1 : 6)))
     {
         Serial.println("tare write successful");
         return true;
@@ -336,14 +344,15 @@ bool AcaiaArduinoBLE::isScaleName(String name)
     return nameShort == "CINCO" || nameShort == "ACAIA" || nameShort == "PYXIS" || nameShort == "LUNAR" || nameShort == "PROCH" || nameShort == "FELIC";
 }
 
-// Function to create request payload (setting payload byte [2] = 6)
-bool AcaiaArduinoBLE::getBattery()
+// Request battery synchronously during init (before weight notifications start)
+bool AcaiaArduinoBLE::requestBatterySync()
 {
+    // Build battery request packet
     byte payload[16] = {0};
     byte bytes[5 + sizeof(payload)];
     bytes[0] = HEADER1;
     bytes[1] = HEADER2;
-    bytes[2] = 6; // get setting
+    bytes[2] = 6; // get setting command
     int cksum1 = 0;
     int cksum2 = 0;
 
@@ -352,43 +361,75 @@ bool AcaiaArduinoBLE::getBattery()
         byte val = payload[i] & 0xFF;
         bytes[3 + i] = val;
         if (i % 2 == 0)
-        {
             cksum1 += val;
-        }
         else
-        {
             cksum2 += val;
-        }
     }
 
     bytes[sizeof(payload) + 3] = (cksum1 & 0xFF);
     bytes[sizeof(payload) + 4] = (cksum2 & 0xFF);
 
-    if (_write.writeValue(bytes, 21))
+    // Send request
+    if (!_write.writeValue(bytes, 21))
     {
-        return true;
-    }
-    else
-    {
+        Serial.println("battery request failed");
         return false;
     }
-}
-// Function to get battery value 
-bool AcaiaArduinoBLE::updateBattery()
-{
+
+    Serial.println("battery request sent");
+
+    // Wait for response (max 1 second)
+    unsigned long start = millis();
     byte input[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
-    // value length checked to be 14 for fw 1.0.0.16 lunar
-    if (_read.valueUpdated() && _read.readValue(input, 13) && input[2] == 8)
+    while (millis() - start < 1000)
     {
-        _currentBattery = input[4] & 0x7f;
-        return true;
+        // Reset watchdog to prevent timeout during battery wait
+        esp_task_wdt_reset();
+
+        if (_read.valueUpdated() && _read.readValue(input, 13) && input[2] == 8)
+        {
+            _currentBattery = input[4] & 0x7f;
+            Serial.print("Battery level received: ");
+            Serial.print(_currentBattery);
+            Serial.println("%");
+
+            // FLUSH any remaining BLE notifications before starting weight updates
+            delay(50);  // Give time for any in-flight notifications to arrive
+            while (_read.valueUpdated())
+            {
+                _read.readValue(input, 13);  // Consume and discard
+            }
+            Serial.println("BLE buffer flushed");
+
+            return true;
+        }
+
+        // Keep LVGL responsive during wait
+        unsigned long currentMillis = millis();
+        if (currentMillis - lastLvUpdate >= lvUpdateInterval)
+        {
+            lastLvUpdate = currentMillis;
+            LVGLTimerHandlerRoutine();
+        }
     }
-    else
+
+    Serial.println("battery response timeout (continuing anyway)");
+
+    // FLUSH buffer even on timeout to prevent stale data
+    delay(50);
+    while (_read.valueUpdated())
     {
-        return false;
+        byte temp[13];
+        _read.readValue(temp, 13);
     }
+    Serial.println("BLE buffer flushed (timeout)");
+
+    return false;
 }
+
+// REMOVED: getBattery() and updateBattery() - they crash when weight notifications are active
+// Battery is now requested during init() via requestBatterySync() before notifications start
 
 int AcaiaArduinoBLE::batteryValue()
 {

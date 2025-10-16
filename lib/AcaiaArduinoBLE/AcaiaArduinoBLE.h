@@ -24,6 +24,7 @@
 
 #include "Arduino.h"
 #include <ArduinoBLE.h>
+#include <esp_task_wdt.h>  // ESP32 task watchdog timer
 
 enum scale_type{
     OLD,    // Lunar (pre-2021)
@@ -44,13 +45,12 @@ class AcaiaArduinoBLE{
         bool heartbeatRequired();
         bool isConnected();
         bool newWeightAvailable();
-        bool getBattery();
-        bool updateBattery();
-        int batteryValue();
+        int batteryValue();  // Returns cached battery level (set during init)
 
 
     private:
         bool isScaleName(String);
+        bool requestBatterySync();  // Request battery during init (before weight notifications)
         float               _currentWeight;
         BLECharacteristic   _write;
         BLECharacteristic   _read;

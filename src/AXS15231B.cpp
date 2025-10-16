@@ -9,10 +9,10 @@ uint32_t transfer_num = 0;
 size_t lcd_PushColors_len = 0;
 
 const static lcd_cmd_t axs15231b_qspi_init[] = {
-    {0x28, {0x00}, 0x40},
-    {0x10, {0x00}, 0x20},
-    {0x11, {0x00}, 0x80},
-    {0x29, {0x00}, 0x00}, 
+    {0x28, {0x00}, 0x40},  // DISPOFF - Display OFF + 20ms delay
+    // {0x10, {0x00}, 0x20},  // SLPIN - Removed: redundant after hardware reset, enables auto-sleep timer
+    {0x11, {0x00}, 0x80},  // SLPOUT - Exit sleep mode + 200ms delay (triggers register loading)
+    {0x29, {0x00}, 0x00},  // DISPON - Display ON
 };
 
 const static lcd_cmd_t axs15231b_qspi_init_new[] = {
