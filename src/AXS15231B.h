@@ -56,5 +56,6 @@ void lcd_PushColors(uint16_t x,
                     uint16_t *data);
 void lcd_PushColors(uint16_t *data, uint32_t len);
 void lcd_sleep();
+void lcd_wake();
 
 bool get_lcd_spi_dma_write(void);

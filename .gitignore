@@ -57,3 +57,13 @@ build
 .DS_Store
 .git.bak*/
 build.log
+
+# WiFi credentials for wireless debugging (contains passwords)
+src/wifi_credentials.h
+platformio_override.ini
+
+# macOS duplicate files (Finder/iCloud creates these)
+*\ [0-9].cpp
+*\ [0-9][0-9].cpp
+*.ino\ [0-9].cpp
+*.ino\ [0-9][0-9].cpp

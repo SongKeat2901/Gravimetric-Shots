@@ -259,17 +259,18 @@ Tate's ongoing work (2023-present):
 
 ## 📊 Project Statistics
 
-**Current Commit:** 3505796 (base) + Oct 9 fixes
-**Date:** Oct 9, 2025
+**Current Commit:** 27fcbcb (watchdog fix) + Oct 16 non-blocking implementation
+**Date:** Oct 16, 2025
 **Build Status:** ✅ Working
-**Flash:** 774,761 bytes (24.6% of 3.1MB)
-**RAM:** 36,980 bytes (11.3% of 327KB)
+**Flash:** 783,929 bytes (24.9% of 3.1MB)
+**RAM:** 37,196 bytes (11.4% of 327KB)
 
 **Recent Changes:**
-- Restored vendored libraries (~190k lines)
-- Added connection watchdog (~50 lines)
-- Moved to src/ directory structure
-- Fixed display initialization bug
+- Implemented non-blocking BLE connection state machine (+1,816 bytes)
+- Fixed watchdog timeout during scale connection
+- Refactored battery request into clean state machine
+- Added BLE buffer flush for reliable weight data flow
+- Fixed macOS extended attributes build issues
 
 ---
 
@@ -348,7 +349,114 @@ pio lib update
 
 # Check repo status
 gh repo view SongKeat2901/Gravimetric-Shots
+
+# Troubleshooting builds on macOS
+xattr -rc .pio              # Clear extended attributes (fixes SCons errors)
+pio run --target clean      # Clean build artifacts
+pio run -j 1                # Single-threaded build (avoid race conditions)
 ```
+
+---
+
+## 🔧 Build System Issues & Solutions
+
+### macOS Extended Attributes Build Failure (Oct 16, 2025)
+
+**Problem:** PlatformIO builds fail with SCons database errors on macOS
+
+**Symptoms:**
+- `FileNotFoundError: .sconsign311.tmp` - SCons can't write build database
+- `undefined reference to 'loop()'` - Linker can't find compiled .ino file
+- Intermittent build failures (sometimes succeeds, sometimes fails)
+- Build directories disappear or are incomplete
+- `firmware.bin` not created despite "SUCCESS" message
+
+**Root Cause:**
+macOS adds extended attributes (metadata) to files and directories:
+- **What:** Extended attributes like `com.apple.provenance`, `com.apple.quarantine`
+- **When:** File downloads, external drive copies, git operations, PlatformIO package downloads
+- **Impact:** SCons build system can't write dependency tracking files (`.d` files, `.sconsign311.tmp`)
+- **Result:** Compilation succeeds but linking fails, or build database corruption
+
+**Diagnosis:**
+```bash
+# Check for extended attributes (look for @ symbol after permissions)
+ls -la .pio/
+# Example output showing problem:
+# drwxr-xr-x@ 3 user staff   96 Oct 16 20:46 .pio/build
+#           ^ this @ indicates extended attributes are present
+
+ls -la src/*.ino
+# -rw-r--r--@ 1 user staff 39467 Oct 16 20:36 src/GravimetricShots.ino
+#           ^ extended attributes on source file
+
+# View specific attributes
+xattr -l .pio
+```
+
+**Solution:**
+```bash
+# Remove extended attributes from .pio directory (recursive, clear all)
+xattr -rc .pio
+
+# Then build normally
+pio run --target upload
+```
+
+**Prevention Strategy 1: Build Wrapper Script**
+Create `build.sh` in project root:
+```bash
+#!/bin/bash
+# build.sh - Automatically clears extended attributes before building
+xattr -rc .pio 2>/dev/null  # Clear attributes (suppress errors if none exist)
+~/.platformio/penv/bin/platformio run "$@"
+```
+
+Make executable: `chmod +x build.sh`
+
+Usage: `./build.sh --target upload`
+
+**Prevention Strategy 2: Git Hook (Automatic)**
+Add to `.git/hooks/post-checkout` and `.git/hooks/post-merge`:
+```bash
+#!/bin/bash
+# Auto-clear extended attributes after git operations
+xattr -rc .pio 2>/dev/null || true
+xattr -rc src 2>/dev/null || true
+```
+
+Make executable: `chmod +x .git/hooks/post-checkout .git/hooks/post-merge`
+
+**Why Extended Attributes Keep Returning:**
+- PlatformIO downloads packages → macOS quarantine flag added
+- Git operations on external repos → provenance tracking added
+- Copying files between drives → metadata preserved
+- Must clear attributes after these operations
+
+**Key Insight:**
+This is a **macOS-specific issue**. Linux and Windows don't have this extended attributes system, so builds work normally on those platforms. If you're experiencing build failures on macOS but CI/CD or other developers' builds work fine, extended attributes are likely the cause.
+
+**Timeline of Discovery:**
+- **Problem:** Non-blocking state machine implementation built successfully once (783,929 bytes)
+- **Failure:** Subsequent builds failed with SCons errors
+- **Discovery:** `ls -la` showed `@` flags on `.pio/` directory and files
+- **Solution:** `xattr -rc .pio` cleared attributes → build succeeded
+- **Result:** Firmware uploaded successfully, non-blocking implementation deployed
+
+**Alternative Workarounds (if xattr doesn't work):**
+```bash
+# Nuclear option: Delete entire .pio directory and rebuild from scratch
+rm -rf .pio
+pio run
+
+# Use Arduino IDE instead (doesn't use SCons)
+# Use esp-idf directly (bypasses PlatformIO entirely)
+```
+
+**Reference Links:**
+- Apple Developer: [Extended Attributes Overview](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/FileSystemProgrammingGuide/FileSystemDetails/FileSystemDetails.html)
+- PlatformIO Issue Tracker: Similar SCons issues reported by macOS users
+- This issue first encountered: Oct 16, 2025 during non-blocking implementation
 
 ---
 

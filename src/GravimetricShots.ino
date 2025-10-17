@@ -20,8 +20,10 @@
  * - Touch-based UI with weight target setting
  * - Shot history tracking and drip delay compensation
  * - Flush mode support
+ * - Wireless debug monitoring via WebSerial (optional, debug builds only)
  */
 
+#include "debug_config.h"  // Wireless debug configuration (must be first for macros)
 #include "lvgl.h" /* https://github.com/lvgl/lvgl.git */
 #include "AXS15231B.h"
 #include <Arduino.h>
@@ -29,8 +31,14 @@
 #include <ui.h>
 #include <AcaiaArduinoBLE.h>
 #include "esp_task_wdt.h" // Task watchdog for auto-recovery from hangs
+#include "nvs_flash.h"    // NVS initialization for WiFi+BLE coexistence
 #include <Preferences.h>
 #include <cstring>
+
+// Power Management for LED control
+#define XPOWERS_CHIP_SY6970
+#include <XPowersLib.h>
+XPowersPPM PMU;
 
 // -----------------------------------------------------------------------------
 // Display and Touch Configuration
@@ -93,6 +101,20 @@ float previousTimerValue  = 0.0f;
 unsigned long lastTimerUpdate = 0;
 const unsigned long TIMER_UPDATE_INTERVAL_MS = 100;  // 100ms = 0.1 second
 
+// Display sleep tracking and auto-wake
+bool displayAsleep = false;
+unsigned long lastTouchTime = 0;
+const unsigned long DISPLAY_SLEEP_TIMEOUT_MS = 300000;  // 5 minutes idle = sleep
+
+// Thermal noise detection for touch controller
+static uint32_t edgeTouchCount = 0;
+static uint32_t lastEdgeTouchTime = 0;
+static bool thermalSuppressionActive = false;
+static uint32_t thermalSuppressionStart = 0;
+static const uint32_t EDGE_TOUCH_WINDOW_MS = 5000;  // 5-second window for counting edge touches
+static const uint32_t EDGE_TOUCH_THRESHOLD = 10;     // >10 edge touches = thermal noise
+static const uint32_t THERMAL_SUPPRESSION_DURATION_MS = 10000;  // Suppress for 10 seconds
+
 // BLE command sequencer state machine (non-blocking)
 enum BLESequenceState {
   BLE_IDLE,
@@ -149,21 +171,16 @@ const unsigned long flushDuration   = 5000; // ms
 bool isFlushing                     = false;
 
 constexpr uint32_t HUMAN_TOUCH_MIN_MS = 100; // Debounce time - prevents accidental double-clicks
+constexpr uint32_t FLUSH_BUTTON_MIN_PRESS_MS = 300; // Flush requires longer press to prevent thermal phantom triggers
 
 Preferences preferences;
 const char *WEIGHT_KEY     = "weight";
 const char *OFFSET_KEY     = "offset";
 const char *BRIGHTNESS_KEY = "brightness";
 
-#define ENABLE_DEBUG_LOG 1
-
-#if ENABLE_DEBUG_LOG
-#define DEBUG_PRINT(x) Serial.print(x)
-#define DEBUG_PRINTLN(x) Serial.println(x)
-#else
-#define DEBUG_PRINT(x) do { } while (0)
-#define DEBUG_PRINTLN(x) do { } while (0)
-#endif
+// DEBUG_PRINT and DEBUG_PRINTLN are now defined in debug_config.h
+// - Production builds: Output to Serial only
+// - Debug builds (-DWIRELESS_DEBUG): Output to BOTH Serial AND WebSerial
 
 bool lastScaleConnected      = false;
 bool hasEverConnectedToScale = false;
@@ -583,6 +600,69 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
 
   if (!type && (rawX || rawY))
   {
+    // ===== THERMAL NOISE PROTECTION =====
+    // Track edge touches to detect thermal drift patterns
+    uint32_t now = millis();
+
+    // Check if touch is near left edge (flush button area - thermal sensitive zone)
+    if (rawY < 50)  // Left edge in portrait mode (Y=0 is left edge)
+    {
+      // Reset counter if window expired
+      if (now - lastEdgeTouchTime > EDGE_TOUCH_WINDOW_MS) {
+        edgeTouchCount = 0;
+      }
+
+      edgeTouchCount++;
+      lastEdgeTouchTime = now;
+
+      // If too many edge touches in short time, activate thermal suppression
+      if (edgeTouchCount > EDGE_TOUCH_THRESHOLD) {
+        if (!thermalSuppressionActive) {
+          thermalSuppressionActive = true;
+          thermalSuppressionStart = now;
+          DEBUG_PRINTLN("⚠️ THERMAL NOISE DETECTED - Suppressing left edge touches for 10s");
+        }
+        edgeTouchCount = 0;  // Reset counter
+      }
+    }
+
+    // Check if thermal suppression is active
+    if (thermalSuppressionActive)
+    {
+      // End suppression after timeout
+      if (now - thermalSuppressionStart > THERMAL_SUPPRESSION_DURATION_MS) {
+        thermalSuppressionActive = false;
+        DEBUG_PRINTLN("✓ Thermal suppression ended");
+      }
+      // Suppress left edge touches during thermal event
+      else if (rawY < 50)
+      {
+        DEBUG_PRINTLN("Left edge touch suppressed (thermal mode)");
+        data->state = LV_INDEV_STATE_REL;
+        return;
+      }
+    }
+    // ===== END THERMAL PROTECTION =====
+
+    // Wake display if asleep (touch-to-wake functionality)
+    if (displayAsleep)
+    {
+      DEBUG_PRINTLN("Touch detected - waking display");
+      lcd_wake();
+
+      // Restore backlight to saved brightness level
+      int LCDBrightness = map(brightness, 0, 100, 70, 256);
+      analogWrite(TFT_BL, LCDBrightness);
+      DEBUG_PRINT("Backlight restored to ");
+      DEBUG_PRINTLN(brightness);
+
+      displayAsleep = false;
+    }
+
+    // Update last touch time for sleep timeout tracking
+    lastTouchTime = millis();
+
+
     int32_t rotatedX = static_cast<int32_t>(EXAMPLE_LCD_V_RES - 1) - static_cast<int32_t>(rawX);
     if (rotatedX < 0)
       rotatedX = 0;
@@ -673,15 +753,37 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
 void ui_event_FlushButton(lv_event_t *e)
 {
   static uint32_t pressedAt = 0;
+  static lv_coord_t pressX = 0;
+  static lv_coord_t pressY = 0;
+
   lv_event_code_t event_code = lv_event_get_code(e);
 
   if (event_code == LV_EVENT_PRESSED)
   {
     pressedAt = millis();
+
+    // Record press coordinates for edge rejection (thermal protection)
+    lv_indev_t* indev = lv_indev_get_act();
+    if (indev) {
+      lv_point_t point;
+      lv_indev_get_point(indev, &point);
+      pressX = point.x;
+      pressY = point.y;
+
+      // Reject touches too close to left edge (thermal drift zone)
+      if (pressX < 5) {
+        DEBUG_PRINTLN("Flush: Rejected edge touch (X < 5px)");
+        pressedAt = 0;  // Invalidate press
+        return;
+      }
+    }
+
+    DEBUG_PRINTLN("Flush button PRESSED");
     return;
   }
 
-  if (event_code == LV_EVENT_CLICKED && (millis() - pressedAt) >= HUMAN_TOUCH_MIN_MS)
+  if (event_code == LV_EVENT_CLICKED && pressedAt > 0 &&
+      (millis() - pressedAt) >= FLUSH_BUTTON_MIN_PRESS_MS)
   {
     if (!isFlushing)
     {
@@ -690,8 +792,21 @@ void ui_event_FlushButton(lv_event_t *e)
         queueScaleStatus("Cannot flush while shot running");
         return;
       }
+
+      DEBUG_PRINT("Flush activated (");
+      DEBUG_PRINT(millis() - pressedAt);
+      DEBUG_PRINTLN("ms press)");
+
       flushingFeature();
     }
+    pressedAt = 0;  // Reset
+  }
+  else if (event_code == LV_EVENT_CLICKED && pressedAt > 0)
+  {
+    DEBUG_PRINT("Flush REJECTED - press too short (");
+    DEBUG_PRINT(millis() - pressedAt);
+    DEBUG_PRINTLN("ms)");
+    pressedAt = 0;
   }
 }
 
@@ -901,10 +1016,27 @@ void checkScaleStatus()
 
     lastScaleConnected = false;
 
-    if (!isFlushing && ((now - lastScaleInitAttempt) >= SCALE_INIT_RETRY_MS || lastScaleInitAttempt == 0))
+    // Non-blocking connection state machine
+    if (!scale.isConnecting())
     {
-      scale.init();
-      lastScaleInitAttempt = now;
+      // Not currently connecting, can start new attempt
+      if (!isFlushing && ((now - lastScaleInitAttempt) >= SCALE_INIT_RETRY_MS || lastScaleInitAttempt == 0))
+      {
+        scale.init();  // Starts state machine, returns immediately
+        lastScaleInitAttempt = now;
+      }
+    }
+    else
+    {
+      // Connection in progress, update state machine
+      if (scale.update())
+      {
+        // Connection successful!
+        Serial.println("checkScaleStatus: Scale fully connected!");
+        queueScaleStatus("Scale connected");
+        firstConnectionNotificationPending = true;
+      }
+      // If update() returns false and state is FAILED, will retry on next loop
     }
 
     currentWeight = 0;
@@ -1002,7 +1134,9 @@ static void processPendingStatusQueue()
 
 static void updateScaleReadings()
 {
-  if (!scale.isConnected() || !scale.newWeightAvailable())
+  // Check newWeightAvailable FIRST - it detects timeouts and updates connection state
+  // Then check isConnected to see if we should process the weight
+  if (!scale.newWeightAvailable() || !scale.isConnected())
     return;
 
   currentWeight = scale.getWeight();
@@ -1130,10 +1264,33 @@ void LVGLTimerHandlerRoutine()
 
 void setup()
 {
-  Serial.begin(115200);
-  delay(5000); // delay wait for the serial port to get ready
+  // Initialize NVS (Non-Volatile Storage) FIRST - before WiFi or BLE
+  // This prevents both radios from trying to initialize NVS independently
+  // Critical for WiFi+BLE coexistence on ESP32-S3
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    nvs_flash_erase();
+    nvs_flash_init();
+  }
 
-  DEBUG_PRINTLN("Serial Started");
+  DEBUG_INIT();  // Initializes Serial (production) or WiFi+WebSerial (debug builds)
+  delay(500); // Reduced from 5000ms - just enough for serial init, won't cause black screen on direct power
+
+  DEBUG_PRINTLN("=== Gravimetric Shots Initializing ===");
+
+  // Initialize PMU (Power Management Unit) for LED control
+  // T-Display-S3-Long uses SY6970 on I2C pins: SDA=15, SCL=10 (same as touch)
+  Wire.begin(TOUCH_IICSDA, TOUCH_IICSCL);  // Touch controller pins (also used for PMU)
+  Wire.setClock(100000);  // 100kHz for reliability under thermal stress
+  if (PMU.init(Wire, TOUCH_IICSDA, TOUCH_IICSCL, SY6970_SLAVE_ADDRESS))
+  {
+    PMU.disableStatLed();  // Turn off green charging indicator LED
+    DEBUG_PRINTLN("PMU initialized, status LED disabled");
+  }
+  else
+  {
+    DEBUG_PRINTLN("PMU init failed (LED control unavailable)");
+  }
 
   // Initialize task watchdog (10 second timeout) - auto-reboot on hang
   esp_task_wdt_init(10, true);  // 10s timeout, panic & reboot on trigger
@@ -1202,6 +1359,7 @@ void setup()
   delay(2);
 
   Wire.begin(TOUCH_IICSDA, TOUCH_IICSCL);
+  Wire.setClock(100000);  // 100kHz for reliability under thermal stress
 
   pinMode(TFT_BL, OUTPUT);    // initialized TFT Backlight Pin as output
   digitalWrite(TFT_BL, LOW);  // Keep backlight OFF during initialization to prevent noise/garbage display
@@ -1286,13 +1444,30 @@ void setup()
   DEBUG_PRINT("Heap total: "); DEBUG_PRINT(ESP.getHeapSize()); DEBUG_PRINT(" bytes, free: "); DEBUG_PRINT(ESP.getFreeHeap()); DEBUG_PRINTLN(" bytes");
   DEBUG_PRINT("PSRAM total: "); DEBUG_PRINT(ESP.getPsramSize()); DEBUG_PRINT(" bytes, free: "); DEBUG_PRINT(ESP.getFreePsram()); DEBUG_PRINTLN(" bytes");
   DEBUG_PRINTLN("Setup Completed");
+
+  // Initialize touch time tracking
+  lastTouchTime = millis();
 }
 
 void loop()
 {
   esp_task_wdt_reset();  // Reset watchdog at start of every loop iteration
 
+  // Update scale connection state machine if connecting
+  if (scale.isConnecting())
+  {
+    scale.update();  // Non-blocking - returns immediately after state update
+  }
+
   LVGLTimerHandlerRoutine();
+
+  // Check for display sleep timeout (5 minutes of inactivity)
+  if (!displayAsleep && (millis() - lastTouchTime) > DISPLAY_SLEEP_TIMEOUT_MS)
+  {
+    DEBUG_PRINTLN("Display sleep timeout - putting display to sleep");
+    lcd_sleep();
+    displayAsleep = true;
+  }
   checkScaleStatus();
   checkHeartBreat();
   handleFlushingCycle();

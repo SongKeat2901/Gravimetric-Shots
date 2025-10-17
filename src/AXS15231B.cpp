@@ -553,5 +553,16 @@ void lcd_PushColors(uint16_t *data, uint32_t len)
 
 void lcd_sleep()
 {
-    lcd_send_cmd(0x10, NULL, 0);
+    lcd_send_cmd(0x28, NULL, 0);  // DISPOFF - Turn display OFF first
+    delay(20);   // Wait for display off command to complete
+    lcd_send_cmd(0x10, NULL, 0);  // SLPIN - Enter sleep mode
+    delay(120);  // Required delay after sleep in (per datasheet)
+}
+
+void lcd_wake()
+{
+    lcd_send_cmd(0x11, NULL, 0);  // SLPOUT - Exit sleep mode
+    delay(120);  // Required delay after sleep out (per datasheet)
+    lcd_send_cmd(0x29, NULL, 0);  // DISPON - Turn display ON
+    delay(10);   // Small delay for display to stabilize
 }

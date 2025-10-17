@@ -70,11 +70,15 @@ int HCIVirtualTransportClass::begin()
   rec_buffer = xStreamBufferCreate(258, 1);
   send_buffer = xStreamBufferCreate(258, 1);
 
+  // Initialize NVS only if not already initialized (WiFi+BLE coexistence fix)
+  // If NVS was initialized early in setup(), this will return ESP_OK and continue
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     ESP_ERROR_CHECK(nvs_flash_erase());
     ret = nvs_flash_init();
   }
+  // ESP_OK means NVS was already initialized - this is normal with WiFi+BLE coexistence
+
   esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
   
 #if CONFIG_IDF_TARGET_ESP32
