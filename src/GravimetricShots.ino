@@ -92,7 +92,7 @@ constexpr int DRIP_DELAY_S        = 3;
 constexpr int N                   = 10; // Samples used for trend line
 
 constexpr int RELAY1           = 48;
-constexpr int SHOT_HISTORY_CAP = 1000;
+constexpr int SHOT_HISTORY_CAP = 2000;  // Increased from 1000 to reduce buffer wrapping frequency
 
 // -----------------------------------------------------------------------------
 // Global State
@@ -116,6 +116,14 @@ unsigned long lastTouchTime = 0;
 unsigned long lastWakeTime = 0;  // Timestamp when display woke up (to prevent phantom touches)
 const unsigned long DISPLAY_SLEEP_TIMEOUT_MS = 300000;  // 5 minutes idle = sleep
 const unsigned long WAKE_GUARD_MS = 1000;  // Ignore touches for 1 second after wake
+const unsigned long TOUCH_CONTROLLER_RECOVERY_MS = 500;  // Wait 500ms for touch controller to power up after wake
+
+// Watchdog debugging - track reset counts and timing
+static unsigned long mainLoopWDTResets = 0;
+static unsigned long bleTaskWDTResets = 0;
+static unsigned long lastMainWDTLog = 0;
+static unsigned long lastBLEWDTLog = 0;
+const unsigned long WDT_LOG_INTERVAL_MS = 5000;  // Log watchdog stats every 5 seconds
 
 // LVGL initialization tracking (prevent crashes from calling lv_timer_handler before init)
 static bool lvglInitialized = false;
@@ -289,7 +297,9 @@ const char *BRIGHTNESS_KEY = "brightness";
 bool lastScaleConnected      = false;
 bool hasEverConnectedToScale = false;
 bool hasShownNoScaleMessage  = false;
-constexpr uint32_t SCALE_INIT_RETRY_MS = 2000;
+// CRITICAL: Must be >= BLE scan timeout (10s) + margin to prevent overlapping scans
+// Overlapping scans corrupt NimBLE stack and cause system reboot at ~30 seconds
+constexpr uint32_t SCALE_INIT_RETRY_MS = 12000;  // 10s scan timeout + 2s cleanup margin
 constexpr uint32_t FLUSH_STATUS_HOLD_MS = 2000;
 uint32_t lastScaleInitAttempt          = 0;
 char pendingScaleStatus[64] = {0};  // Fixed buffer - eliminates heap fragmentation
@@ -355,14 +365,22 @@ static inline void queueConnectionUpdate(bool connected) {
 }
 
 /**
- * @brief Process all pending UI updates from the queue (LVGL-safe, Core 1 only)
+ * @brief Process pending UI updates from the queue (LVGL-safe, Core 1 only)
  * @note Called from main loop (Core 1) - ONLY place that updates LVGL!
+ * @note CRITICAL: Limits processing to prevent watchdog timeout
  */
 static void processUIUpdates() {
     UIUpdateMessage msg;
 
-    // Process all pending messages (non-blocking)
-    while (xQueueReceive(uiUpdateQueue, &msg, 0) == pdTRUE) {
+    // CRITICAL FIX: Limit messages processed per loop iteration to prevent watchdog timeout
+    // At 10Hz weight updates, we get ~10 messages/sec. Main loop runs at ~100Hz (10ms).
+    // Process max 5 messages per iteration = 50ms worst case (well under 10s watchdog)
+    const int MAX_MESSAGES_PER_ITERATION = 5;
+    int processedCount = 0;
+
+    // Process pending messages (non-blocking, with limit)
+    while (processedCount < MAX_MESSAGES_PER_ITERATION &&
+           xQueueReceive(uiUpdateQueue, &msg, 0) == pdTRUE) {
         switch (msg.type) {
             case UI_UPDATE_WEIGHT:
                 if (ui_ScaleLabel) {
@@ -398,6 +416,7 @@ static void processUIUpdates() {
                 }
                 break;
         }
+        processedCount++;
     }
 }
 
@@ -516,6 +535,7 @@ static void handleBLESequence()
         bleSequenceState = BLE_IDLE;
         bleSequenceInProgress = false;
         shot.brewing = false;
+        scale.setIsBrewing(false);
         isFlushing = false;
         return;
       }
@@ -544,6 +564,7 @@ static void handleBLESequence()
         bleSequenceState = BLE_IDLE;
         bleSequenceInProgress = false;
         shot.brewing = false;
+        scale.setIsBrewing(false);
         isFlushing = false;
         return;
       }
@@ -567,6 +588,7 @@ static void handleBLESequence()
         bleSequenceState = BLE_IDLE;
         bleSequenceInProgress = false;
         shot.brewing = false;
+        scale.setIsBrewing(false);
         isFlushing = false;
         return;
       }
@@ -587,6 +609,9 @@ static void handleBLESequence()
       LOG_INFO(TAG_SHOT, "BLE: Starting shot - turning ON pump");
       setRelayState(true);              // Turn ON pump (relay)
       updateDisplayRefreshRate(true);   // 60Hz display mode
+
+      // Enable weight logging during shots
+      scale.setIsBrewing(true);
 
       bleSequenceState = BLE_IDLE;
       LOG_INFO(TAG_SHOT, "Shot started successfully!");
@@ -609,6 +634,7 @@ static void setBrewingState(bool brewing)
     {
       queueScaleStatus("Scale not connected");
       shot.brewing = false;
+      scale.setIsBrewing(false);
       isFlushing   = false;
       return;
     }
@@ -646,6 +672,9 @@ static void stopBrew(bool setDefaultStatus, ShotEndReason reason = USER_STOPPED)
   setBrewingState(false);
   updateDisplayRefreshRate(false);  // Switch back to normal refresh (30Hz) when stopped
 
+  // Disable weight logging (return to silent idle mode)
+  scale.setIsBrewing(false);
+
   if (setDefaultStatus && wasBrewing)
   {
     // Display appropriate message based on end reason
@@ -679,6 +708,13 @@ static void startBrew()
   }
 
   isFlushing = false;
+
+  // CRITICAL FIX: Reset shotTimer BEFORE setting brewing=true
+  // Otherwise old timer value from previous shot triggers "Max brew duration" immediately
+  // during the BLE command sequence (reset→tare→start takes ~300ms)
+  shot.shotTimer = 0.0f;
+  shot.datapoints = 0;
+
   shot.brewing = true;
   setBrewingState(true);
 }
@@ -810,8 +846,40 @@ bool sendBLECommand(BLECommand cmd, uint32_t param = 0) {
 // Display & Touch Callbacks
 // -----------------------------------------------------------------------------
 
+// Display flush callback monitoring - detects when graphics rendering stops
+static unsigned long lastFlushCall = 0;
+static unsigned long flushCallCount = 0;
+static bool flushStoppedWarned = false;
+
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
 {
+  unsigned long now = millis();
+
+  // Detect if flush callback hasn't been called (graphics stopped rendering)
+  if (lastFlushCall > 0 && (now - lastFlushCall) > 5000) {
+    if (!flushStoppedWarned) {
+      LOG_ERROR(TAG_UI, "🖼️  GRAPHICS RENDERING STOPPED!");
+      LOG_ERROR(TAG_UI, "   Last flush: %lums ago (display content frozen)", now - lastFlushCall);
+      LOG_ERROR(TAG_UI, "   Total flushes: %lu", flushCallCount);
+      flushStoppedWarned = true;
+    }
+  } else if (flushStoppedWarned && (now - lastFlushCall) <= 5000) {
+    LOG_ERROR(TAG_UI, "✅ GRAPHICS RENDERING RESUMED");
+    flushStoppedWarned = false;
+  }
+
+  lastFlushCall = now;
+  flushCallCount++;
+
+  // Log flush activity every 10 seconds (reduced to catch issues before 35s crash)
+  static unsigned long lastFlushLog = 0;
+  if (now - lastFlushLog > 10000) {
+    LOG_WARN(TAG_UI, "🖼️  Display Flush: %lu calls in last 10s (~%lu Hz)",
+             flushCallCount, flushCallCount / 10);
+    flushCallCount = 0;
+    lastFlushLog = now;
+  }
+
   uint32_t w = (area->x2 - area->x1 + 1);
   uint32_t h = (area->y2 - area->y1 + 1);
 
@@ -835,15 +903,48 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
 uint8_t read_touchpad_cmd[11] = {0xb5, 0xab, 0xa5, 0x5a, 0x0, 0x0, 0x0, 0x8};
 void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
 {
-  // CRITICAL: Don't access I2C when display is asleep
-  // Touch controller (CST816 @ 0x3B) powers down with display
-  // Attempting I2C read causes: [E][Wire.cpp:513] requestFrom(): i2cRead returned Error -1
+  // CRITICAL: Special handling when display is asleep
+  // Touch controller (CST816 @ 0x3B) has hardware interrupt pin that wakes us up
+  // We need to detect the wake event and restore display, but NOT access I2C yet
   if (displayAsleep)
   {
+    // Check if touch interrupt pin is active (indicates user touched screen)
+    // Touch controller INT pin pulls low on touch event
+    // For now, we'll wake on ANY call to this function during sleep
+    // (LVGL still polls even during sleep)
+    LOG_INFO(TAG_UI, "=== WAKE EVENT: Touch detected during sleep ===");
+    LOG_INFO(TAG_UI, "Waking display and restoring backlight...");
+    lcd_wake();
+
+    // Note: Display controller and touch controller need time to stabilize
+    // We don't use delay() here (blocks main loop → watchdog timeout)
+    // Instead, the TOUCH_CONTROLLER_RECOVERY_MS check below handles this
+
+    // Restore backlight to saved brightness level
+    int LCDBrightness = map(brightness, 0, 100, 70, 256);
+    analogWrite(TFT_BL, LCDBrightness);
+    LOG_INFO(TAG_UI, "Display awake! Backlight=%d (brightness=%d%%)", LCDBrightness, brightness);
+
+    displayAsleep = false;
+    lastWakeTime = millis();  // Record wake time to guard against phantom touches
+    lastTouchTime = millis(); // Update touch time to prevent immediate re-sleep
+
+    // Return no-touch for this cycle (prevent phantom touch during wake)
     data->point.x = 0;
     data->point.y = 0;
     data->state = LV_INDEV_STATE_REL;  // Released (no touch)
-    return;  // Skip I2C access completely
+    return;  // Skip I2C access this cycle - let controller stabilize
+  }
+
+  // CRITICAL: Skip I2C access during touch controller recovery period after wake
+  // CST816 touch controller powers down with display and needs 500ms to recover
+  if (lastWakeTime > 0 && (millis() - lastWakeTime) < TOUCH_CONTROLLER_RECOVERY_MS)
+  {
+    // Still in recovery period - don't access I2C yet
+    data->point.x = 0;
+    data->point.y = 0;
+    data->state = LV_INDEV_STATE_REL;  // Released (no touch)
+    return;  // Skip I2C access - prevents Error -1 spam during recovery
   }
 
   uint8_t buff[20] = {0};
@@ -928,22 +1029,8 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
     }
     // ===== END THERMAL PROTECTION =====
 
-    // Wake display if asleep (touch-to-wake functionality)
-    if (displayAsleep)
-    {
-      LOG_DEBUG(TAG_UI, "Touch detected - waking display");
-      lcd_wake();
-
-      // Restore backlight to saved brightness level
-      int LCDBrightness = map(brightness, 0, 100, 70, 256);
-      analogWrite(TFT_BL, LCDBrightness);
-      LOG_DEBUG(TAG_UI, "Backlight restored to %d", brightness);
-
-      displayAsleep = false;
-      lastWakeTime = millis();  // Record wake time to guard against phantom touches
-    }
-
     // GUARD: Ignore touch events within 1 second after wake (prevents phantom touches from I2C glitches)
+    // Wake logic now happens at the top of this function (line 860) before I2C access
     if (lastWakeTime > 0 && (millis() - lastWakeTime) < WAKE_GUARD_MS)
     {
       // Still in wake guard period - reject this touch
@@ -1025,6 +1112,13 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
     data->state   = LV_INDEV_STATE_PR;
     data->point.x = lastPointX;
     data->point.y = lastPointY;
+
+    // Log valid touches (throttled to avoid spam)
+    static unsigned long lastTouchLog = 0;
+    if (millis() - lastTouchLog > 2000) {  // Log every 2 seconds max
+      LOG_DEBUG(TAG_UI, "Touch detected: (%d, %d)", data->point.x, data->point.y);
+      lastTouchLog = millis();
+    }
 
     char buf[20] = {0};
     sprintf(buf, "(%d, %d)", data->point.x, data->point.y);
@@ -1303,6 +1397,8 @@ void checkScaleStatus()
     lastScaleConnected = false;
 
     // Non-blocking connection state machine
+    // NOTE: scale.update() is now called in bleTaskFunction main loop
+    // This function only handles init retry logic
     if (!scale.isConnecting())
     {
       // Not currently connecting, can start new attempt
@@ -1312,18 +1408,8 @@ void checkScaleStatus()
         lastScaleInitAttempt = now;
       }
     }
-    else
-    {
-      // Connection in progress, update state machine
-      if (scale.update())
-      {
-        // Connection successful!
-        LOG_INFO(TAG_SCALE, "Scale fully connected!");
-        queueScaleStatus("Scale connected");
-        firstConnectionNotificationPending = true;
-      }
-      // If update() returns false and state is FAILED, will retry on next loop
-    }
+    // NOTE: Dead code removed (was checking scale.isConnected() inside !connected block)
+    // Connection success is now only handled in the else block below
 
     currentWeight = 0;
     firstConnectionNotificationPending = true;
@@ -1337,7 +1423,9 @@ void checkScaleStatus()
   {
     // UI updates removed - handled by updateUIWithBLEData() on Core 1
 
-    if (!lastScaleConnected)
+    // CRITICAL FIX: Only show "connected" if FULLY connected, not just mid-handshake
+    // Prevents false "Scale Connected" messages during connection failures
+    if (!lastScaleConnected && scale.getConnectionState() == CONN_CONNECTED)
     {
       queueScaleStatus("Scale Connected");
     }
@@ -1424,11 +1512,26 @@ static void updateScaleReadings()
 
   currentWeight = scale.getWeight();
 
-  // PROFESSIONAL FIX: Use message queue for thread-safe UI updates
-  // BLE task (Core 0) enqueues weight text, main loop (Core 1) updates LVGL
-  char buffer[10];
-  dtostrf(currentWeight, 5, 1, buffer);
-  queueUIUpdate(UI_UPDATE_WEIGHT, buffer);
+  // CRITICAL FIX: Throttle UI updates to prevent watchdog timeout
+  // Rate limit weight updates to 10Hz (100ms) to prevent UI queue overflow
+  // Without throttling, 3-4 updates/sec fills queue → processUIUpdates() blocks → watchdog timeout
+  static unsigned long lastWeightUIUpdate = 0;
+  static float lastUIWeight = 0;
+  const unsigned long WEIGHT_UI_UPDATE_INTERVAL = 100;  // 100ms = 10Hz max UI updates
+
+  unsigned long now = millis();
+  bool weightChanged = fabs(currentWeight - lastUIWeight) > 0.1;  // >0.1g change
+  bool intervalElapsed = (now - lastWeightUIUpdate) >= WEIGHT_UI_UPDATE_INTERVAL;
+
+  if (weightChanged || intervalElapsed) {
+    // PROFESSIONAL FIX: Use message queue for thread-safe UI updates
+    // BLE task (Core 0) enqueues weight text, main loop (Core 1) updates LVGL
+    char buffer[10];
+    dtostrf(currentWeight, 5, 1, buffer);
+    queueUIUpdate(UI_UPDATE_WEIGHT, buffer);
+    lastWeightUIUpdate = now;
+    lastUIWeight = currentWeight;
+  }
 
   // Rate limit weight printing to prevent WebSocket overflow
   // Only print every 100ms OR when weight changes by >0.1g
@@ -1437,7 +1540,6 @@ static void updateScaleReadings()
   const unsigned long WEIGHT_PRINT_INTERVAL = 100;  // 100ms = 10Hz (was 10ms = 100Hz)
 
   bool shouldPrint = false;
-  unsigned long now = millis();
 
   if (now - lastWeightPrint >= WEIGHT_PRINT_INTERVAL) {
     shouldPrint = true;  // Time-based: print every 100ms
@@ -1465,7 +1567,7 @@ static void updateScaleReadings()
     std::memmove(shot.time_s,   shot.time_s + 1,   shot.datapoints * sizeof(float));
     std::memmove(shot.weight,   shot.weight + 1,   shot.datapoints * sizeof(float));
 
-    LOG_WARN(TAG_SHOT, "Shot history buffer full, oldest datapoint discarded");
+    LOG_DEBUG(TAG_SHOT, "Shot history buffer full, oldest datapoint discarded");  // Changed to DEBUG - this is normal operation
   }
 
   const float nowSeconds = seconds_f() - shot.start_timestamp_s;
@@ -1539,6 +1641,11 @@ static void handleShotWatchdogs()
 extern uint32_t transfer_num;
 extern size_t lcd_PushColors_len;
 
+// LVGL Freeze Detection - track when lv_timer_handler() was last called successfully
+static unsigned long lastLVGLTimerCall = 0;
+static unsigned long lvglTimerCallCount = 0;
+static bool lvglFreezeWarned = false;
+
 void LVGLTimerHandlerRoutine()
 {
   // CRITICAL: Don't call lv_timer_handler() before LVGL is initialized
@@ -1546,8 +1653,37 @@ void LVGLTimerHandlerRoutine()
   if (!lvglInitialized)
     return;
 
+  unsigned long now = millis();
+
+  // Detect LVGL freeze (no successful timer calls for 3+ seconds)
+  if (lastLVGLTimerCall > 0 && (now - lastLVGLTimerCall) > 3000) {
+    if (!lvglFreezeWarned) {
+      LOG_ERROR(TAG_UI, "🚨 LVGL FREEZE DETECTED!");
+      LOG_ERROR(TAG_UI, "   Last successful timer call: %lums ago", now - lastLVGLTimerCall);
+      LOG_ERROR(TAG_UI, "   Total calls: %lu", lvglTimerCallCount);
+      LOG_ERROR(TAG_UI, "   transfer_num=%d, lcd_PushColors_len=%d", transfer_num, lcd_PushColors_len);
+      lvglFreezeWarned = true;
+    }
+  } else if (lvglFreezeWarned && (now - lastLVGLTimerCall) <= 3000) {
+    LOG_ERROR(TAG_UI, "✅ LVGL RECOVERED from freeze");
+    lvglFreezeWarned = false;
+  }
+
   if (transfer_num <= 0 && lcd_PushColors_len <= 0)
+  {
     lv_timer_handler();
+    lastLVGLTimerCall = now;
+    lvglTimerCallCount++;
+
+    // Log LVGL activity every 10 seconds (reduced to catch issues before 35s crash)
+    static unsigned long lastActivityLog = 0;
+    if (now - lastActivityLog > 10000) {
+      LOG_WARN(TAG_UI, "📊 LVGL Activity: %lu timer calls in last 10s (~%lu Hz)",
+               lvglTimerCallCount, lvglTimerCallCount / 10);
+      lvglTimerCallCount = 0;
+      lastActivityLog = now;
+    }
+  }
 
   if (transfer_num <= 1 && lcd_PushColors_len > 0)
   {
@@ -1602,11 +1738,69 @@ void setup()
   LOG_INFO(TAG_SYS, "Serial initialized @ 115200 baud");
   LOG_INFO(TAG_SYS, "FreeRTOS mutex created successfully");
 
+  // Log reset reason - WHY did we boot? (FORCE with raw Serial to bypass log filtering)
+  esp_reset_reason_t reset_reason = esp_reset_reason();
+  const char* reason_str;
+  switch(reset_reason) {
+    case ESP_RST_POWERON:   reason_str = "Power-on reset"; break;
+    case ESP_RST_SW:        reason_str = "Software reset via esp_restart()"; break;
+    case ESP_RST_PANIC:     reason_str = "Exception/panic (CRASH!)"; break;
+    case ESP_RST_INT_WDT:   reason_str = "Interrupt watchdog timeout"; break;
+    case ESP_RST_TASK_WDT:  reason_str = "Task watchdog timeout"; break;
+    case ESP_RST_WDT:       reason_str = "Other watchdog timeout"; break;
+    case ESP_RST_DEEPSLEEP: reason_str = "Deep sleep wake"; break;
+    case ESP_RST_BROWNOUT:  reason_str = "Brownout detector (power glitch)"; break;
+    case ESP_RST_EXT:       reason_str = "External reset pin"; break;
+    case ESP_RST_SDIO:      reason_str = "SDIO reset"; break;
+    default:                reason_str = "Unknown reset"; break;
+  }
+
+  // CRITICAL: Wait for USB CDC to reconnect BEFORE printing
+  // Serial monitor drops connection during reset, needs time to reconnect
+  delay(500);
+
+  // FORCE output with raw Serial (bypasses all log filtering - GUARANTEED to show)
+  Serial.println("\n\n╔═══════════════════════════════════════════╗");
+  Serial.print("║  RESET REASON: ");
+  Serial.print(reason_str);
+  for (int i = strlen(reason_str); i < 26; i++) Serial.print(" ");
+  Serial.println(" ║");
+  Serial.println("╚═══════════════════════════════════════════╝");
+
+  // Special diagnostics for interrupt watchdog timeout (most common crash type)
+  if (reset_reason == ESP_RST_INT_WDT) {
+    Serial.println("║                                           ║");
+    Serial.println("║  🚨 INTERRUPT WATCHDOG TIMEOUT!          ║");
+    Serial.println("║                                           ║");
+    Serial.println("║  An ISR (interrupt) ran too long         ║");
+    Serial.println("║  Timeout: 1000ms (increased from 300ms)  ║");
+    Serial.println("║                                           ║");
+    Serial.println("║  Likely causes:                          ║");
+    Serial.println("║  • BLE notification handler blocking     ║");
+    Serial.println("║  • Display SPI DMA stall                 ║");
+    Serial.println("║  • Touch I2C interrupt conflict          ║");
+    Serial.println("║  • LVGL rendering during critical section║");
+    Serial.println("╚═══════════════════════════════════════════╝");
+  } else if (reset_reason == ESP_RST_PANIC) {
+    Serial.println("║                                           ║");
+    Serial.println("║  💀 EXCEPTION/PANIC - Check above logs!  ║");
+    Serial.println("║  (Should see backtrace with addresses)   ║");
+    Serial.println("╚═══════════════════════════════════════════╝");
+  } else {
+    Serial.println("╚═══════════════════════════════════════════╝");
+  }
+  Serial.println();
+  Serial.flush();  // Force USB CDC to send immediately
+
   // Step 3: Initialize NimBLE BEFORE WiFi (critical for radio coexistence)
   LOG_INFO(TAG_SYS, "");
   LOG_INFO(TAG_SYS, "=== Initializing NimBLE (BEFORE WiFi) ===");
   NimBLEDevice::init("GravimetricShots");
   LOG_INFO(TAG_SYS, "NimBLE initialized - radio claimed by BLE stack");
+
+  // BACKUP: Log reset reason again via LOG_ERROR (in case raw Serial was missed)
+  // This provides redundancy if USB CDC wasn't connected during early boot
+  LOG_ERROR(TAG_SYS, "🔄 RESET REASON: %s", reason_str);
 
   // Step 4: Initialize WiFi (debug builds only) via DEBUG_INIT()
   // NimBLE is already running, WiFi will coexist properly
@@ -1906,13 +2100,49 @@ void bleTaskFunction(void* parameter)
     esp_task_wdt_add(NULL);  // Add current task (BLE task) to watchdog
     LOG_INFO(TAG_TASK, "BLE task added to watchdog monitor");
 
-    // Track stack usage
+    // Track stack usage and heap monitoring
     unsigned long lastStackCheck = 0;
+    unsigned long lastHeapLog = 0;
+    const unsigned long HEAP_LOG_INTERVAL_MS = 30000;  // Log heap every 30 seconds
 
     while (true)
     {
-        // Reset watchdog at start of each iteration
+        // Reset watchdog and track timing
         esp_task_wdt_reset();
+        bleTaskWDTResets++;
+
+        // Log watchdog reset statistics every 5 seconds
+        unsigned long now = millis();
+        if (now - lastBLEWDTLog > WDT_LOG_INTERVAL_MS) {
+            LOG_DEBUG(TAG_TASK, "BLE Task WDT: %lu resets, last reset %lums ago",
+                      bleTaskWDTResets, now - lastBLEWDTLog);
+            lastBLEWDTLog = now;
+        }
+
+        // Log heap status every 30 seconds (detects memory leaks from BLE scanning)
+        if (now - lastHeapLog > HEAP_LOG_INTERVAL_MS) {
+            // Get INTERNAL DRAM heap (not PSRAM) - this is what gets exhausted during BLE scanning
+            size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            size_t min_free_internal = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+            // Always log heap status (changed from DEBUG to WARN for visibility)
+            LOG_WARN(TAG_TASK, "💾 Internal DRAM: free=%u, min_ever=%u, largest=%u bytes",
+                     free_internal, min_free_internal, largest_block);
+
+            // Progressive warning levels
+            if (free_internal < 100000) {
+                LOG_ERROR(TAG_TASK, "🔴 CRITICAL: Internal heap = %u bytes (< 100KB!)", free_internal);
+            }
+            if (free_internal < 50000) {
+                LOG_ERROR(TAG_TASK, "💀 FATAL: Internal heap = %u bytes (< 50KB! CRASH IMMINENT!)", free_internal);
+            }
+            if (largest_block < 20000) {
+                LOG_ERROR(TAG_TASK, "⚠️  Heap fragmentation severe! Largest block = %u bytes", largest_block);
+            }
+
+            lastHeapLog = now;
+        }
 
         // Process commands from main loop (non-blocking check)
         BLECommandMessage cmd;
@@ -1920,10 +2150,10 @@ void bleTaskFunction(void* parameter)
             processBLECommand(cmd);
         }
 
-        // Run scale state machine (blocking operations happen here - that's OK!)
-        if (scale.isConnecting()) {
-            scale.update();  // This can block for seconds - doesn't affect UI!
-        }
+        // CRITICAL FIX: Always call update() to drive state machine
+        // This must be called every loop iteration, not just when connecting
+        // Without this, scan timeouts don't transition properly and watchdog triggers
+        scale.update();
 
         // Check scale status and manage connection
         checkScaleStatus();
@@ -1947,13 +2177,19 @@ void bleTaskFunction(void* parameter)
         updateSharedConnectionStatus(scale.isConnected(), scale.isConnecting());
         updateSharedWeight(currentWeight);
 
-        // Monitor stack usage every 10 seconds
+        // Monitor BLE task stack usage every 10 seconds (detect stack overflow)
         if (millis() - lastStackCheck > 10000) {
             UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(NULL);
-            LOG_VERBOSE(TAG_TASK, "Stack watermark: %u bytes remaining", stackLeft);
 
-            if (stackLeft < 1000) {
-                LOG_WARN(TAG_TASK, "WARNING: Low stack! Consider increasing stack size!");
+            // Always log stack status (changed from VERBOSE to WARN for visibility)
+            LOG_WARN(TAG_TASK, "📚 BLE Task Stack: %u bytes remaining (of 20480 total)", stackLeft);
+
+            // Progressive stack overflow warnings
+            if (stackLeft < 5000) {
+                LOG_ERROR(TAG_TASK, "🔴 LOW STACK WARNING! Only %u bytes remaining!", stackLeft);
+            }
+            if (stackLeft < 2000) {
+                LOG_ERROR(TAG_TASK, "🚨 STACK OVERFLOW IMMINENT! Only %u bytes left!", stackLeft);
             }
 
             lastStackCheck = millis();
@@ -1995,7 +2231,17 @@ void updateUIWithBLEData()
 // Main Loop - UI Operations Only (Core 1)
 void loop()
 {
-  esp_task_wdt_reset();  // Reset watchdog at start of every loop iteration
+  // Reset watchdog and track timing
+  esp_task_wdt_reset();
+  mainLoopWDTResets++;
+
+  // Log watchdog reset statistics every 5 seconds
+  unsigned long now = millis();
+  if (now - lastMainWDTLog > WDT_LOG_INTERVAL_MS) {
+    LOG_DEBUG(TAG_TASK, "Main Loop WDT: %lu resets, last reset %lums ago",
+              mainLoopWDTResets, now - lastMainWDTLog);
+    lastMainWDTLog = now;
+  }
 
   // DIAGNOSTIC: Log main loop heartbeat every 10 seconds to detect freezes
   static unsigned long lastLoopLog = 0;
@@ -2011,6 +2257,14 @@ void loop()
   // LVGL UI updates (CRITICAL - must run frequently)
   LVGLTimerHandlerRoutine();
 
+  // DIAGNOSTIC: LVGL heartbeat to detect display freezes
+  static unsigned long lastLVGLLog = 0;
+  if (millis() - lastLVGLLog > 5000) {  // Every 5 seconds
+    LOG_DEBUG(TAG_UI, "LVGL heartbeat - display active (asleep=%d) | WDT: Main=%lu BLE=%lu",
+              displayAsleep, mainLoopWDTResets, bleTaskWDTResets);
+    lastLVGLLog = millis();
+  }
+
   // Process queued UI updates from BLE task (professional thread-safe pattern)
   processUIUpdates();
 
@@ -2018,11 +2272,11 @@ void loop()
   updateUIWithBLEData();
 
   // Display sleep/wake management (UI operation)
-  // DISABLED FOR DEBUGGING - Prevents display from sleeping during development
-  // Uncomment to re-enable auto-sleep after 5 minutes of inactivity
+  // TEMPORARILY DISABLED - Testing if sleep is causing reboots
   // if (!displayAsleep && (millis() - lastTouchTime) > DISPLAY_SLEEP_TIMEOUT_MS)
   // {
-  //   LOG_DEBUG(TAG_UI, "Display sleep timeout - putting display to sleep");
+  //   LOG_INFO(TAG_UI, "Display sleep timeout (5 min idle) - putting display to sleep");
+  //   LOG_INFO(TAG_UI, "Touch screen to wake");
   //   lcd_sleep();
   //   displayAsleep = true;
   // }
@@ -2041,4 +2295,9 @@ void loop()
   //   - updateScaleReadings()
   //   - updateShotTimer()
   //   - handleShotWatchdogs()
+
+  // CRITICAL: Yield CPU to prevent main loop from starving BLE task
+  // Without this, main loop runs at 56,000 Hz and blocks BLE task
+  // This allows FreeRTOS scheduler to balance workload between cores
+  delay(1);  // 1ms delay = ~1000 Hz max loop rate (plenty fast for UI)
 }

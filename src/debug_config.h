@@ -80,12 +80,30 @@ typedef enum {
     LOG_VERBOSE = 5   // Everything including trace
 } log_level_t;
 
-// Global log level (change this to control verbosity)
+// =============================================================================
+// Per-Tag Log Level Configuration (Fine-Grained Control)
+// =============================================================================
+// Set individual log levels for each subsystem tag
+// This allows you to silence noisy subsystems while keeping others verbose
+//
+// Example: To debug LVGL issues, set LVGL to VERBOSE and BLE to ERROR
+//
+// Available tags: System, Task, BLE, Scale, UI, Relay, Weight
+// =============================================================================
+
+// Default global log level (fallback for tags not explicitly configured)
 #ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL LOG_VERBOSE  // Troubleshooting: VERBOSE level (shows ALL messages)
-// #define LOG_LOCAL_LEVEL LOG_INFO  // Production: INFO level
-// #define LOG_LOCAL_LEVEL LOG_DEBUG  // Development: DEBUG level
+#define LOG_LOCAL_LEVEL LOG_DEBUG  // DEBUG level only
 #endif
+
+// Per-tag overrides (comment out to use LOG_LOCAL_LEVEL default)
+#define LOG_LEVEL_SYSTEM  LOG_DEBUG   // System startup/shutdown
+#define LOG_LEVEL_TASK    LOG_DEBUG   // Task heartbeats
+#define LOG_LEVEL_BLE     LOG_DEBUG   // BLE operations
+#define LOG_LEVEL_SCALE   LOG_DEBUG   // Scale communication
+#define LOG_LEVEL_UI      LOG_DEBUG   // UI/LVGL updates
+#define LOG_LEVEL_RELAY   LOG_DEBUG   // Relay control
+#define LOG_LEVEL_WEIGHT  LOG_DEBUG   // Weight updates
 
 // ANSI color codes (prefixed with GS_ to avoid ESP-IDF conflicts)
 #define GS_COLOR_BLACK   "30"
@@ -102,14 +120,44 @@ typedef enum {
 #define GS_LOG_BOLD(COLOR)   "\033[1;" COLOR "m"
 #define GS_LOG_RESET_COLOR   "\033[0m"
 
+// Helper to get per-tag log level
+inline log_level_t get_tag_log_level(const char* tag) {
+    // Check tag-specific overrides (case-insensitive comparison)
+#ifdef LOG_LEVEL_SYSTEM
+    if (strcasecmp(tag, "System") == 0 || strcasecmp(tag, "SYS") == 0) return LOG_LEVEL_SYSTEM;
+#endif
+#ifdef LOG_LEVEL_TASK
+    if (strcasecmp(tag, "Task") == 0) return LOG_LEVEL_TASK;
+#endif
+#ifdef LOG_LEVEL_BLE
+    if (strcasecmp(tag, "BLE") == 0) return LOG_LEVEL_BLE;
+#endif
+#ifdef LOG_LEVEL_SCALE
+    if (strcasecmp(tag, "Scale") == 0) return LOG_LEVEL_SCALE;
+#endif
+#ifdef LOG_LEVEL_UI
+    if (strcasecmp(tag, "UI") == 0) return LOG_LEVEL_UI;
+#endif
+#ifdef LOG_LEVEL_RELAY
+    if (strcasecmp(tag, "Relay") == 0) return LOG_LEVEL_RELAY;
+#endif
+#ifdef LOG_LEVEL_WEIGHT
+    if (strcasecmp(tag, "Weight") == 0) return LOG_LEVEL_WEIGHT;
+#endif
+
+    // Default to global level for unknown tags
+    return static_cast<log_level_t>(LOG_LOCAL_LEVEL);
+}
+
 // Core logging function
 inline void log_write(log_level_t level, const char* tag, const char* format, ...)
     __attribute__((format(printf, 3, 4)));
 
 inline void log_write(log_level_t level, const char* tag, const char* format, ...) {
-    // Check if level is enabled (compile-time optimization)
-    if (level > LOG_LOCAL_LEVEL) {
-        return;  // Level too verbose, skip completely
+    // Check if level is enabled for this specific tag
+    log_level_t tag_level = get_tag_log_level(tag);
+    if (level > tag_level) {
+        return;  // Level too verbose for this tag, skip completely
     }
 
     // Try to take mutex (or continue without if not created yet for early boot messages)

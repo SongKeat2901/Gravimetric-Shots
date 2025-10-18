@@ -45,11 +45,12 @@ class AcaiaScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 
             // DIAGNOSTIC: Log ALL BLE devices found during scan
             // This helps verify ESP32 BLE is working and shows what devices are visible
+            // Changed to VERBOSE to reduce log spam (50-100+ devices during scan)
             if (name.length() > 0) {
-                LOG_DEBUG(TAG, "BLE device found: '%s' (RSSI: %d dBm, Address: %s)",
-                          name.c_str(),
-                          advertisedDevice->getRSSI(),
-                          advertisedDevice->getAddress().toString().c_str());
+                LOG_VERBOSE(TAG, "BLE device found: '%s' (RSSI: %d dBm, Address: %s)",
+                            name.c_str(),
+                            advertisedDevice->getRSSI(),
+                            advertisedDevice->getAddress().toString().c_str());
             } else {
                 LOG_VERBOSE(TAG, "BLE device found: <no name> (RSSI: %d dBm, Address: %s)",
                             advertisedDevice->getRSSI(),
@@ -113,6 +114,7 @@ AcaiaArduinoBLE::AcaiaArduinoBLE()
     _currentWeight = 999;
     _connected = false;
     _packetPeriod = 0;
+    _isBrewing = false;  // Start in idle mode (no weight logging)
 
     // Initialize state machine
     _connState = CONN_IDLE;
@@ -120,7 +122,7 @@ AcaiaArduinoBLE::AcaiaArduinoBLE()
     _connTimeout = 0;
     _mac = "";
     _lastDisconnect = 0;
-    
+
     // Initialize NimBLE pointers
     _pClient = nullptr;
     _pService = nullptr;
@@ -169,9 +171,10 @@ bool AcaiaArduinoBLE::init(String mac)
 
 bool AcaiaArduinoBLE::tare()
 {
-    if (!_connected || !_pWriteChar)
+    // Check for NULL pointers - disconnect can happen asynchronously
+    if (!_connected || !_pWriteChar || !_pClient || !_pClient->isConnected())
     {
-        LOG_DEBUG(TAG, "tare failed: not connected");
+        LOG_DEBUG(TAG, "tare failed: not connected or NULL pointer");
         return false;
     }
 
@@ -191,9 +194,10 @@ bool AcaiaArduinoBLE::tare()
 
 bool AcaiaArduinoBLE::startTimer()
 {
-    if (!_connected || !_pWriteChar)
+    // Check for NULL pointers - disconnect can happen asynchronously
+    if (!_connected || !_pWriteChar || !_pClient || !_pClient->isConnected())
     {
-        LOG_DEBUG(TAG, "start timer failed: not connected");
+        LOG_DEBUG(TAG, "start timer failed: not connected or NULL pointer");
         return false;
     }
 
@@ -212,9 +216,10 @@ bool AcaiaArduinoBLE::startTimer()
 
 bool AcaiaArduinoBLE::stopTimer()
 {
-    if (!_connected || !_pWriteChar)
+    // Check for NULL pointers - disconnect can happen asynchronously
+    if (!_connected || !_pWriteChar || !_pClient || !_pClient->isConnected())
     {
-        LOG_DEBUG(TAG, "stop timer failed: not connected");
+        LOG_DEBUG(TAG, "stop timer failed: not connected or NULL pointer");
         return false;
     }
 
@@ -233,9 +238,10 @@ bool AcaiaArduinoBLE::stopTimer()
 
 bool AcaiaArduinoBLE::resetTimer()
 {
-    if (!_connected || !_pWriteChar)
+    // Check for NULL pointers - disconnect can happen asynchronously
+    if (!_connected || !_pWriteChar || !_pClient || !_pClient->isConnected())
     {
-        LOG_DEBUG(TAG, "reset timer failed: not connected");
+        LOG_DEBUG(TAG, "reset timer failed: not connected or NULL pointer");
         return false;
     }
 
@@ -254,9 +260,11 @@ bool AcaiaArduinoBLE::resetTimer()
 
 bool AcaiaArduinoBLE::heartbeat()
 {
-    if (!_connected || !_pWriteChar)
+    // CRITICAL: Check for NULL pointers - scale can disconnect asynchronously
+    // onDisconnect() callback sets _pWriteChar = nullptr
+    if (!_connected || !_pWriteChar || !_pClient || !_pClient->isConnected())
     {
-        LOG_VERBOSE(TAG, "heartbeat failed: not connected");
+        LOG_VERBOSE(TAG, "heartbeat failed: not connected or NULL pointer");
         return false;
     }
 
@@ -282,6 +290,11 @@ bool AcaiaArduinoBLE::heartbeat()
 float AcaiaArduinoBLE::getWeight()
 {
     return _currentWeight;
+}
+
+void AcaiaArduinoBLE::setIsBrewing(bool brewing)
+{
+    _isBrewing = brewing;
 }
 
 bool AcaiaArduinoBLE::heartbeatRequired()
@@ -317,22 +330,19 @@ void AcaiaArduinoBLE::notifyCallback(NimBLERemoteCharacteristic* pRemoteCharacte
 
 void AcaiaArduinoBLE::handleNotification(uint8_t* pData, size_t length)
 {
-    // DIAGNOSTIC: Log ALL incoming notifications to debug why weight data isn't updating
-    LOG_DEBUG(TAG, "Notification received: %d bytes, type=%d", length, _type);
-
-    // Log first few bytes for debugging
-    if (length >= 5) {
-        LOG_VERBOSE(TAG, "  Data: [0]=0x%02X [1]=0x%02X [2]=0x%02X [3]=0x%02X [4]=0x%02X",
-                    pData[0], pData[1], pData[2], pData[3], pData[4]);
-    }
+    // CRITICAL: NO LOGGING IN NOTIFICATION CALLBACK!
+    // This function runs at high frequency (~20 Hz when scale is active)
+    // Logging causes serial buffer overflow → system crashes after 6-30 seconds
+    // Previous crash cause: LOG_VERBOSE + LOG_WARN printing 180 bytes per packet
+    // Combined with 242 Hz display refresh = >3000ms blocking → watchdog timeout
 
     // Parse weight data based on scale type
     if (NEW == _type && length >= 13 && pData[2] == 0x0C && pData[4] == 0x05)
     {
-        // New Acaia (Lunar 2021, Pyxis)
+        // New Acaia (Lunar 2021+, Pyxis, and Lunar 2019-2021 transitional)
         _currentWeight = (((pData[6] & 0xff) << 8) + (pData[5] & 0xff)) / pow(10, pData[9]) * ((pData[10] & 0x02) ? -1 : 1);
 
-        LOG_DEBUG(TAG, "Weight parsed: %.2fg", _currentWeight);
+        // NO LOGGING - causes serial buffer overflow at 20 Hz notification rate
 
         if (_lastPacket)
         {
@@ -345,7 +355,7 @@ void AcaiaArduinoBLE::handleNotification(uint8_t* pData, size_t length)
         // Old Acaia (Lunar pre-2021)
         _currentWeight = (((pData[3] & 0xff) << 8) + (pData[2] & 0xff)) / pow(10, pData[6]) * ((pData[7] & 0x02) ? -1 : 1);
 
-        LOG_DEBUG(TAG, "Weight parsed: %.2fg", _currentWeight);
+        // NO LOGGING - causes serial buffer overflow at 20 Hz notification rate
 
         if (_lastPacket)
         {
@@ -361,7 +371,7 @@ void AcaiaArduinoBLE::handleNotification(uint8_t* pData, size_t length)
                          (pData[5] - 0x30) * 10 + (pData[6] - 0x30) * 1 +
                          (pData[7] - 0x30) * 0.1 + (pData[8] - 0x30) * 0.01);
 
-        LOG_DEBUG(TAG, "Weight parsed: %.2fg", _currentWeight);
+        // NO LOGGING - causes serial buffer overflow at 20 Hz notification rate
 
         if (_lastPacket)
         {
@@ -371,11 +381,10 @@ void AcaiaArduinoBLE::handleNotification(uint8_t* pData, size_t length)
     }
     else
     {
-        // DIAGNOSTIC: Notification didn't match any known format
-        LOG_WARN(TAG, "Unrecognized notification format (type=%d, len=%d, [2]=0x%02X, [4]=0x%02X)",
-                 _type, length,
-                 length > 2 ? pData[2] : 0x00,
-                 length > 4 ? pData[4] : 0x00);
+        // Unrecognized packet - silently ignore
+        // NO LOGGING HERE! Previous LOG_WARN printed 180 bytes per packet
+        // This caused serial buffer overflow → system crashes
+        // Diagnostic: If needed, add counter and log in main loop (not here!)
     }
 }
 
@@ -639,12 +648,38 @@ void AcaiaArduinoBLE::stateSubscribing()
         return;
     }
 
+    // CRITICAL: Check for disconnect AFTER subscribe() completes
+    // The scale can disconnect asynchronously during subscribe() call
+    // onDisconnect() callback sets _pReadChar = nullptr
+    // We must verify pointers are still valid before transitioning
+    if (!_pReadChar || !_pWriteChar || !_pClient || !_pClient->isConnected()) {
+        LOG_ERROR(TAG, "Scale disconnected during subscription (race condition prevented)");
+        transitionTo(CONN_FAILED, 0);
+        return;
+    }
+
     LOG_INFO(TAG, "Subscribed to notifications");
     transitionTo(CONN_IDENTIFYING, 5000);  // 5s identify timeout
 }
 
 void AcaiaArduinoBLE::stateIdentifying()
 {
+    // CRITICAL: Check for disconnect during settling delay
+    // Scale can disconnect asynchronously during the 200ms wait
+    if (!_pWriteChar || !_pClient || !_pClient->isConnected()) {
+        LOG_ERROR(TAG, "Scale disconnected during identify delay (race condition prevented)");
+        transitionTo(CONN_FAILED, 0);
+        return;
+    }
+
+    // STABILITY FIX: Wait 200ms after subscription before sending identify
+    // BLE task runs at 100Hz (10ms loop), so 200ms = ~20 iterations
+    // Gives scale adequate time to process the subscription command
+    // Without this delay, scale may disconnect during identify (especially on first attempt)
+    if (millis() - _connStateStart < 200) {
+        return;  // Check again in 10ms (next BLE task loop iteration)
+    }
+
     LOG_DEBUG(TAG, "Sending identify ...");
 
     if (!_pWriteChar->writeValue(IDENTIFY, 20, true)) {
@@ -659,6 +694,21 @@ void AcaiaArduinoBLE::stateIdentifying()
 
 void AcaiaArduinoBLE::stateBattery()
 {
+    // CRITICAL: Check for disconnect during settling delay
+    // Scale can disconnect asynchronously during the 200ms wait
+    if (!_pWriteChar || !_pClient || !_pClient->isConnected()) {
+        LOG_ERROR(TAG, "Scale disconnected during battery delay (race condition prevented)");
+        transitionTo(CONN_FAILED, 0);
+        return;
+    }
+
+    // STABILITY FIX: Wait 200ms after identify command before battery request
+    // BLE task runs at 100Hz (10ms loop), so 200ms = ~20 iterations
+    // Gives scale time to process the identify command
+    if (millis() - _connStateStart < 200) {
+        return;  // Check again in 10ms (next BLE task loop iteration)
+    }
+
     LOG_DEBUG(TAG, "Requesting battery (skipping for now) ...");
     // Battery request implementation can be added later
     transitionTo(CONN_NOTIFICATIONS, 2000);
@@ -666,7 +716,27 @@ void AcaiaArduinoBLE::stateBattery()
 
 void AcaiaArduinoBLE::stateNotifications()
 {
+    // CRITICAL: Check for disconnect during settling delay
+    // Scale can disconnect asynchronously during the 200ms wait
+    if (!_pWriteChar || !_pClient || !_pClient->isConnected()) {
+        LOG_ERROR(TAG, "Scale disconnected during notifications delay (race condition prevented)");
+        transitionTo(CONN_FAILED, 0);
+        return;
+    }
+
+    // STABILITY FIX: Wait 200ms before enabling weight notifications
+    // BLE task runs at 100Hz (10ms loop), so 200ms = ~20 iterations
+    // Gives scale time to process previous commands (identify, battery)
+    if (millis() - _connStateStart < 200) {
+        return;  // Check again in 10ms (next BLE task loop iteration)
+    }
+
     LOG_DEBUG(TAG, "Enabling weight notifications ...");
+
+    // DIAGNOSTIC: Log the NOTIFICATION_REQUEST packet being sent
+    LOG_INFO(TAG, "Sending NOTIFICATION_REQUEST: [ef dd 0c 09 00 01 01 02 02 05 03 04 15 06]");
+    LOG_DEBUG(TAG, "  Scale type: %s", _type == NEW ? "NEW" : (_type == OLD ? "OLD" : "GENERIC"));
+    LOG_DEBUG(TAG, "  Expecting weight packets: [2]=0x0C [4]=0x05 for NEW scales");
 
     if (!_pWriteChar->writeValue(NOTIFICATION_REQUEST, 14, true)) {
         LOG_ERROR(TAG, "Notification request write failed");
@@ -674,7 +744,8 @@ void AcaiaArduinoBLE::stateNotifications()
         return;
     }
 
-    LOG_INFO(TAG, "Weight notifications enabled");
+    LOG_INFO(TAG, "Weight notifications enabled (waiting for 17-byte weight packets)");
+    LOG_DEBUG(TAG, "  If no weight data appears, check notification handler logs");
     _connected = true;
     _lastHeartBeat = millis();
     _lastPacket = 0;  // Reset packet timer
@@ -780,8 +851,10 @@ bool AcaiaArduinoBLE::update()
             _packetPeriod = 0;
             _lastHeartBeat = 0;
 
-            // Small delay
-            delay(100);
+            // STABILITY FIX: Delay before retry (increased from 100ms to 500ms)
+            // Gives scale adequate time to reset after disconnect
+            // Especially important after identify/subscription failures
+            delay(500);
 
             // Restart scan
             LOG_INFO(TAG, "Scan restarted (non-blocking reconnect)");

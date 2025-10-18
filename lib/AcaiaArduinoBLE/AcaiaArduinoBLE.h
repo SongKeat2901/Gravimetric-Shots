@@ -105,6 +105,9 @@ class AcaiaArduinoBLE{
         ConnectionState getConnectionState();  // Get current state for UI
         const char* getStateString();       // Get human-readable state name
 
+        // Brewing state tracking for conditional logging
+        void setIsBrewing(bool brewing);    // Set brewing state (controls weight log verbosity)
+
         // Friend classes for callback access
         friend class AcaiaClientCallbacks;
         friend class AcaiaScanCallbacks;
@@ -136,6 +139,7 @@ class AcaiaArduinoBLE{
         int                 _currentBattery;
         long                _packetPeriod;
         long                _lastPacket;
+        bool                _isBrewing;      // Track brewing state for conditional logging
 
         // State machine variables
         ConnectionState     _connState;
