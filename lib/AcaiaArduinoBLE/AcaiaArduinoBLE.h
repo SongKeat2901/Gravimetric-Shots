@@ -77,7 +77,8 @@ enum ConnectionState {
     CONN_BATTERY,        // Requesting battery level
     CONN_NOTIFICATIONS,  // Enabling weight notifications
     CONN_CONNECTED,      // Fully connected
-    CONN_FAILED          // Connection failed
+    CONN_FAILED,         // Connection failed
+    CONN_RECONNECT_DELAY // Non-blocking 500ms delay before scan restart
 };
 
 // Forward declarations for friend classes

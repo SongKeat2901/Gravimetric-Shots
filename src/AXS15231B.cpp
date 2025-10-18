@@ -2,6 +2,8 @@
 #include "SPI.h"
 #include "Arduino.h"
 #include "driver/spi_master.h"
+#include "esp_log.h"  // For ESP_LOGI, ESP_LOGD, ESP_LOGW
+#include "debug_config.h"  // For LOG_*() macros with serialMutex protection
 
 static volatile bool lcd_spi_dma_write = false;
 extern void my_print(const char *buf);
@@ -77,6 +79,33 @@ static void WriteData(uint8_t data)
 
 static void lcd_send_cmd(uint32_t cmd, uint8_t *dat, uint32_t len)
 {
+    // DIAGNOSTIC: Track critical display commands that control sleep/wake/power
+    // Only log commands related to display state (not every pixel write)
+    static uint32_t dispoff_count = 0;
+    static uint32_t dispon_count = 0;
+    static uint32_t slpin_count = 0;
+    static uint32_t slpout_count = 0;
+
+    switch(cmd) {
+        case 0x28:  // DISPOFF - Display OFF (part of sleep sequence)
+            dispoff_count++;
+            LOG_ERROR("LCD_DMA", "🚨 DISPOFF (0x28) command #%lu - Display turning OFF!", dispoff_count);
+            break;
+        case 0x29:  // DISPON - Display ON (part of wake sequence)
+            dispon_count++;
+            LOG_INFO("LCD_DMA", "✅ DISPON (0x29) command #%lu - Display turning ON", dispon_count);
+            break;
+        case 0x10:  // SLPIN - Enter sleep mode (critical!)
+            slpin_count++;
+            LOG_ERROR("LCD_DMA", "💤 SLPIN (0x10) command #%lu - Entering SLEEP mode!", slpin_count);
+            break;
+        case 0x11:  // SLPOUT - Exit sleep mode
+            slpout_count++;
+            LOG_INFO("LCD_DMA", "🌟 SLPOUT (0x11) command #%lu - Exiting SLEEP mode", slpout_count);
+            break;
+        // Don't log other commands (0x2A/0x2B/0x2C are pixel writes - too noisy)
+    }
+
 #if LCD_USB_QSPI_DREVER == 1
     TFT_CS_L;
     spi_transaction_t t;
@@ -95,7 +124,7 @@ static void lcd_send_cmd(uint32_t cmd, uint8_t *dat, uint32_t len)
             t.addr = 0X0000;
             len = 4;
         }
-        else 
+        else
         {
             t.cmd = 0x02;
             t.addr = cmd << 8;
@@ -105,7 +134,7 @@ static void lcd_send_cmd(uint32_t cmd, uint8_t *dat, uint32_t len)
         t.addr = cmd << 8;
     #endif
     if (len != 0) {
-        t.tx_buffer = dat; 
+        t.tx_buffer = dat;
         t.length = 8 * len;
     } else {
         t.tx_buffer = NULL;
@@ -307,12 +336,24 @@ void lcd_PushColors(uint16_t x,
                         uint16_t high,
                         uint16_t *data)
     {
+        // DIAGNOSTIC: Track every call to lcd_PushColors (DMA version)
+        static uint32_t dma_push_count = 0;
+        dma_push_count++;
+
         static bool first_send = 1;
         static uint16_t *p = (uint16_t *)data;
         static uint32_t transfer_num_old = 0;
 
         if(data != NULL && (width != 0) && (high != 0))
         {
+            // DIAGNOSTIC: Log entry to DMA lcd_PushColors with details
+            LOG_INFO("LCD_DMA", "🖼️  Push #%lu: (%d,%d) %dx%d = %d pixels",
+                     dma_push_count, x, y, width, high, width*high);
+            if (dma_push_count <= 10) {  // Only log pixel data for first 10 pushes
+                LOG_DEBUG("LCD_DMA", "   First 4 pixels: [0]=0x%04X [1]=0x%04X [2]=0x%04X [3]=0x%04X",
+                          data[0], data[1], data[2], data[3]);
+            }
+
             lcd_PushColors_len = width * high;
             p = (uint16_t *)data;
             first_send = 1;
@@ -320,6 +361,13 @@ void lcd_PushColors(uint16_t x,
             transfer_num = 0;
             lcd_address_set(x, y, x + width - 1, y + high - 1);
             TFT_CS_L;
+        }
+        else
+        {
+            // DIAGNOSTIC: Log NULL or invalid calls
+            ESP_LOGW("LCD_DMA", "⚠️  Push #%lu SKIPPED: data=%p, w=%d, h=%d",
+                     dma_push_count, data, width, high);
+            return;  // Don't process invalid calls
         }
 
         for (int x = 0; x < (transfer_num_old - (transfer_num_old-(transfer_num_old-transfer_num))); x++) {
@@ -364,6 +412,11 @@ void lcd_PushColors(uint16_t x,
             transfer_num++;
             transfer_num_old++;
             lcd_PushColors_len -= chunk_size;
+
+            // DIAGNOSTIC: Log DMA transaction queuing
+            ESP_LOGD("LCD_DMA", "   DMA transaction #%lu: chunk=%zu pixels, remaining=%lu",
+                     (uint32_t)transfer_num, chunk_size, (uint32_t)lcd_PushColors_len);
+
             esp_err_t ret;
 
             ESP_ERROR_CHECK(spi_device_queue_trans(spi, (spi_transaction_t *)&t, portMAX_DELAY));
@@ -437,11 +490,24 @@ void lcd_PushColors(uint16_t x,
                         uint16_t high,
                         uint16_t *data)
     {
+        // DIAGNOSTIC: Log EVERY lcd_PushColors call with full details
+        static uint32_t pushCallCount = 0;
+        pushCallCount++;
+
+        if (data != NULL && width > 0 && high > 0) {
+            ESP_LOGI("LCD", "PushColors #%lu: (%d,%d) %dx%d = %d pixels, first_pixel=0x%04X",
+                     pushCallCount, x, y, width, high, width*high, data[0]);
+        } else {
+            ESP_LOGI("LCD", "PushColors #%lu: NULL or zero size (x=%d,y=%d,w=%d,h=%d,data=%p)",
+                     pushCallCount, x, y, width, high, data);
+        }
+
     #if LCD_USB_QSPI_DREVER == 1
         bool first_send = 1;
         size_t len = width * high;
         uint16_t *p = (uint16_t *)data;
 
+        ESP_LOGD("LCD", "  Setting display window: (%d,%d)-(%d,%d)", x, y, x+width-1, y+high-1);
         lcd_address_set(x, y, x + width - 1, y + high - 1);
         
         do {
@@ -553,16 +619,29 @@ void lcd_PushColors(uint16_t *data, uint32_t len)
 
 void lcd_sleep()
 {
+    // DIAGNOSTIC: Log function entry - this should NEVER be called in production!
+    // Display sleep is commented out in main loop, so if this appears, something is wrong!
+    LOG_ERROR("LCD_DMA", "⚠️⚠️⚠️ lcd_sleep() FUNCTION CALLED! ⚠️⚠️⚠️");
+    LOG_ERROR("LCD_DMA", "   This function should NOT be called (sleep is disabled)!");
+    LOG_ERROR("LCD_DMA", "   Check for rogue code calling lcd_sleep()");
+
     lcd_send_cmd(0x28, NULL, 0);  // DISPOFF - Turn display OFF first
     delay(20);   // Wait for display off command to complete
     lcd_send_cmd(0x10, NULL, 0);  // SLPIN - Enter sleep mode
     delay(120);  // Required delay after sleep in (per datasheet)
+
+    LOG_ERROR("LCD_DMA", "💤 Display is now in SLEEP mode");
 }
 
 void lcd_wake()
 {
+    // DIAGNOSTIC: Log wake sequence
+    LOG_INFO("LCD_DMA", "🌟 lcd_wake() FUNCTION CALLED - Waking display");
+
     lcd_send_cmd(0x11, NULL, 0);  // SLPOUT - Exit sleep mode
     delay(120);  // Required delay after sleep out (per datasheet)
     lcd_send_cmd(0x29, NULL, 0);  // DISPON - Turn display ON
     delay(10);   // Small delay for display to stabilize
+
+    LOG_INFO("LCD_DMA", "✅ Display wake sequence complete");
 }

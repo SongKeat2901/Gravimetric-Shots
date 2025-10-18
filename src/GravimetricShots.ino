@@ -57,6 +57,10 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *buf;
 static lv_color_t *buf1;
 
+// DIAGNOSTIC: Store initial buffer addresses to detect corruption
+static lv_color_t *buf_initial = NULL;
+static lv_color_t *buf1_initial = NULL;
+
 constexpr int TOUCH_IICSCL = 10;
 constexpr int TOUCH_IICSDA = 15;
 constexpr int TOUCH_RES    = 16;
@@ -850,12 +854,86 @@ bool sendBLECommand(BLECommand cmd, uint32_t param = 0) {
 // NOTE: Flush only happens when UI changes (not continuous during idle - this is normal!)
 // Real freeze detection is done via lv_timer_handler() monitoring (see LVGLTimerHandlerRoutine)
 static unsigned long flushCallCount = 0;
+static unsigned long lastFlushTimestamp = 0;  // Track last flush time for UI health monitoring
+unsigned long lastTouchEvent = 0;  // Track last touch event for UI health monitoring (non-static for extern access)
 
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
 {
   unsigned long now = millis();
 
   flushCallCount++;
+
+  // Track last flush time for UI health monitoring
+  lastFlushTimestamp = now;
+
+  // ===== DIAGNOSTIC: PSRAM Buffer Integrity Check =====
+  // Check every 100 flushes to avoid performance impact
+  static uint32_t bufferIntegrityCheckCount = 0;
+  if (flushCallCount % 100 == 0) {
+    bufferIntegrityCheckCount++;
+
+    // Verify LVGL draw buffer pointers haven't been corrupted
+    if (disp != NULL && disp->draw_buf != NULL) {
+      lv_color_t* current_buf1 = (lv_color_t*)disp->draw_buf->buf1;
+      lv_color_t* current_buf2 = (lv_color_t*)disp->draw_buf->buf2;
+
+      // Check if buffers moved (indicates memory corruption)
+      if (buf_initial != NULL && current_buf1 != buf_initial) {
+        LOG_ERROR(TAG_UI, "🚨 BUFFER CORRUPTION! buf1 moved: %p → %p",
+                 buf_initial, current_buf1);
+      }
+      if (buf1_initial != NULL && current_buf2 != buf1_initial) {
+        LOG_ERROR(TAG_UI, "🚨 BUFFER CORRUPTION! buf2 moved: %p → %p",
+                 buf1_initial, current_buf2);
+      }
+
+      // Log buffer status periodically
+      if (bufferIntegrityCheckCount % 10 == 0) {  // Every 1000 flushes
+        LOG_DEBUG(TAG_UI, "💾 Buffer Check #%lu: buf1=%p buf2=%p (OK)",
+                 bufferIntegrityCheckCount, current_buf1, current_buf2);
+      }
+    } else {
+      LOG_ERROR(TAG_UI, "🚨 Display driver structure is NULL!");
+    }
+
+    // Verify color_p parameter isn't NULL
+    if (color_p == NULL) {
+      LOG_ERROR(TAG_UI, "🚨 color_p parameter is NULL in my_disp_flush!");
+      lv_disp_flush_ready(disp);
+      return;
+    }
+  }
+  // ===== END BUFFER INTEGRITY CHECK =====
+
+  uint32_t w = (area->x2 - area->x1 + 1);
+  uint32_t h = (area->y2 - area->y1 + 1);
+
+  // ===== DIAGNOSTIC: Pixel Data Validation =====
+  // Log detailed flush information for first 5 flushes to diagnose blank display
+  static uint8_t flushDetailCount = 0;
+  if (flushDetailCount < 5) {
+    LOG_INFO(TAG_UI, "🔬 FLUSH #%d: area=(%ld,%ld)-(%ld,%ld) size=%lux%lu pixels=%lu",
+             flushDetailCount + 1,
+             area->x1, area->y1, area->x2, area->y2,
+             w, h, w * h);
+
+    // Sample first few pixels to verify data isn't all zeros
+    uint16_t* pixels = (uint16_t *)&color_p->full;
+    LOG_INFO(TAG_UI, "   First pixels: [0]=%04X [1]=%04X [2]=%04X [3]=%04X",
+             pixels[0], pixels[1], pixels[2], pixels[3]);
+
+    // Check if buffer contains any non-zero pixels
+    uint32_t totalPixels = w * h;
+    uint32_t nonZeroCount = 0;
+    for (uint32_t i = 0; i < totalPixels; i++) {
+      if (pixels[i] != 0) nonZeroCount++;
+    }
+    LOG_INFO(TAG_UI, "   Non-zero pixels: %lu of %lu (%.1f%%)",
+             nonZeroCount, totalPixels, (nonZeroCount * 100.0) / totalPixels);
+
+    flushDetailCount++;
+  }
+  // ===== END DIAGNOSTIC =====
 
   // Log flush activity every 10 seconds for diagnostic purposes
   // NOTE: Flush rate varies with UI activity (0 Hz when idle is normal)
@@ -866,9 +944,6 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
     flushCallCount = 0;
     lastFlushLog = now;
   }
-
-  uint32_t w = (area->x2 - area->x1 + 1);
-  uint32_t h = (area->y2 - area->y1 + 1);
 
 #ifdef LCD_SPI_DMA
   char i = 0;
@@ -891,8 +966,8 @@ uint8_t read_touchpad_cmd[11] = {0xb5, 0xab, 0xa5, 0x5a, 0x0, 0x0, 0x0, 0x8};
 void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
 {
   // CRITICAL: Special handling when display is asleep
-  // Touch controller (CST816 @ 0x3B) has hardware interrupt pin that wakes us up
-  // We need to detect the wake event and restore display, but NOT access I2C yet
+  // Touch controller (CUSTOM PROTOCOL @ 0x3B, NOT standard CST816) has hardware interrupt pin
+  // that wakes us up. We need to detect the wake event and restore display, but NOT access I2C yet
   if (displayAsleep)
   {
     // Check if touch interrupt pin is active (indicates user touched screen)
@@ -944,31 +1019,64 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
   static uint8_t historyCount      = 0;
   static uint8_t historyWriteIndex = 0;
 
+  // DIAGNOSTIC: Log I2C touch transaction
+  static uint32_t touchReadCount = 0;
+  touchReadCount++;
+
+  // CRITICAL: Match LilyGO lvgl_demo.ino I2C sequence (no error checking on Wire calls)
+  // Touch controller I2C state machine gets confused by timing delays from error checks
+  // BUT: Add timeout to prevent infinite blocking when touch returns [00 00 00...] data
+  // See: https://github.com/Xinyuan-LilyGO/T-Display-S3-Long/blob/main/examples/lvgl_demo/lvgl_demo.ino#L70-L75
   Wire.beginTransmission(0x3B);
   Wire.write(read_touchpad_cmd, 8);
   Wire.endTransmission();
   Wire.requestFrom(0x3B, 8);
 
-  // CRITICAL: Add timeout protection to prevent infinite loop
-  // If touch controller doesn't respond within 100ms, return gracefully
+  // CRITICAL: Prevent infinite blocking when touch controller returns [00 00 00...]
+  // Simple 50ms timeout - short enough to not confuse controller timing
   unsigned long timeout_start = millis();
-  while (!Wire.available())
-  {
-    if (millis() - timeout_start > 100)  // 100ms timeout
-    {
-      // Timeout - no response from touch controller
-      data->point.x = 0;
-      data->point.y = 0;
-      data->state = LV_INDEV_STATE_REL;
-      return;
+  while (!Wire.available()) {
+    if (millis() - timeout_start > 50) {
+      break;  // Timeout - read whatever's available (might be zeros)
     }
   }
 
   Wire.readBytes(buff, 8);
 
+  // ===== DIAGNOSTIC: Touch I2C Data Logging =====
+  // Log raw I2C data from touch controller every 100 reads (to avoid spam)
+  if (touchReadCount % 100 == 0) {
+    LOG_DEBUG(TAG_UI, "Touch I2C #%lu: [%02X %02X %02X %02X %02X %02X %02X %02X]",
+             touchReadCount, buff[0], buff[1], buff[2], buff[3], buff[4], buff[5], buff[6], buff[7]);
+  }
+  // NOTE: Periodic ChipID polling was REMOVED - it's not supported by this touch controller
+  // and caused crashes (see LilyGO lvgl_demo.ino for reference implementation)
+  // ===== END TOUCH I2C DATA LOGGING =====
+
   uint16_t rawX = AXS_GET_POINT_X(buff, 0);
   uint16_t rawY = AXS_GET_POINT_Y(buff, 0);
   uint16_t type = AXS_GET_GESTURE_TYPE(buff);
+
+  // CRITICAL: Handle [00 00 00...] and [AF AF AF...] corrupted patterns
+  // These patterns indicate touch controller errors and should be treated as "no touch"
+  // [00 00 00...]: Clean but invalid state (may cause Wire.available() timeout)
+  // [AF AF AF...]: Error state after touch interaction (0xAF = 0xA2 | 0x0D)
+  bool isCorruptedPattern = (buff[0] == 0x00 && buff[1] == 0x00) ||
+                            (buff[0] == 0xAF && buff[1] == 0xAF);
+
+  if (isCorruptedPattern) {
+    // Force touch release to prevent LVGL from getting stuck in pressed state
+    data->point.x = 0;
+    data->point.y = 0;
+    data->state = LV_INDEV_STATE_REL;
+    return;
+  }
+
+  // DIAGNOSTIC: Log parsed touch data when touch detected
+  if (!type && (rawX || rawY)) {
+    LOG_INFO(TAG_UI, "Touch RAW data #%lu: rawX=%d, rawY=%d, type=%d, buff0=0x%02X",
+             touchReadCount, rawX, rawY, type, buff[0]);
+  }
 
   if (!type && (rawX || rawY))
   {
@@ -1100,6 +1208,10 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
     data->point.x = lastPointX;
     data->point.y = lastPointY;
 
+    // Track last touch event time for UI health monitoring
+    extern unsigned long lastTouchEvent;
+    lastTouchEvent = millis();
+
     // Log valid touches (throttled to avoid spam)
     static unsigned long lastTouchLog = 0;
     if (millis() - lastTouchLog > 2000) {  // Log every 2 seconds max
@@ -1114,10 +1226,22 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
   }
   else
   {
+    // DIAGNOSTIC: Log when touch is released (not every poll, only on state change)
+    static bool wasPressed = false;
+    if (wasPressed) {
+      LOG_INFO(TAG_UI, "Touch RELEASED (no touch detected, type=%d, rawX=%d, rawY=%d)", type, rawX, rawY);
+      wasPressed = false;
+    }
+
     data->state = LV_INDEV_STATE_REL;
     haveLastPoint     = false;
     historyCount      = 0;
     historyWriteIndex = 0;
+
+    // Track if we were just pressed (for next cycle logging)
+    if (data->state == LV_INDEV_STATE_PR) {
+      wasPressed = true;
+    }
   }
 }
 
@@ -1885,12 +2009,56 @@ void setup()
   Wire.begin(TOUCH_IICSDA, TOUCH_IICSCL);
   Wire.setClock(100000);  // 100kHz for reliability under thermal stress
 
+  // DIAGNOSTIC: Test touch controller I2C communication after reset
+  LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
+  LOG_INFO(TAG_UI, "  🔬 TOUCH CONTROLLER (CST816) INITIALIZATION TEST");
+  LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
+  LOG_INFO(TAG_UI, "Touch reset: GPIO %d (toggled LOW 10ms, now HIGH)", TOUCH_RES);
+  LOG_INFO(TAG_UI, "I2C pins: SDA=GPIO %d, SCL=GPIO %d, freq=100kHz", TOUCH_IICSDA, TOUCH_IICSCL);
+
+  delay(50);  // Give touch controller time to boot after reset
+
+  // Test I2C communication with touch controller
+  Wire.beginTransmission(0x3B);
+  uint8_t i2c_test_error = Wire.endTransmission();
+  if (i2c_test_error == 0) {
+    LOG_INFO(TAG_UI, "✅ Touch controller ACK at address 0x3B");
+  } else {
+    LOG_ERROR(TAG_UI, "❌ Touch controller NO ACK at 0x3B (error=%d)", i2c_test_error);
+    LOG_ERROR(TAG_UI, "   Error codes: 1=too long, 2=NACK addr, 3=NACK data, 4=other");
+  }
+
+  // NOTE: Touch controller uses CUSTOM protocol (not standard CST816)
+  // ChipID register 0xA7 is NOT supported - reading it causes controller confusion and crashes
+  // LilyGO lvgl_demo.ino does NOT send ANY I2C commands to touch controller during setup()!
+  // First touch I2C transaction happens naturally in my_touchpad_read() during loop()
+  // Sending test commands (like 0xD0) can put controller into undefined state
+  LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
+
   pinMode(TFT_BL, OUTPUT);    // initialized TFT Backlight Pin as output
   digitalWrite(TFT_BL, LOW);  // Keep backlight OFF during initialization to prevent noise/garbage display
 
   axs15231_init(); // initialized Screen
 
   lv_init(); // initialized LVGL
+
+  // ===== DIAGNOSTIC: Register LVGL log callback =====
+  // Route LVGL internal logs through our logging system
+  #if LV_USE_LOG
+    lv_log_register_print_cb([](const char* msg) {
+      // LVGL messages come with newlines, remove them
+      char clean_msg[256];
+      strncpy(clean_msg, msg, sizeof(clean_msg) - 1);
+      clean_msg[sizeof(clean_msg) - 1] = '\0';
+      size_t len = strlen(clean_msg);
+      if (len > 0 && clean_msg[len - 1] == '\n') {
+        clean_msg[len - 1] = '\0';
+      }
+      LOG_WARN("LVGL", "%s", clean_msg);
+    });
+    LOG_INFO(TAG_SYS, "✅ LVGL logging enabled (callback registered)");
+  #endif
+  // ===== END LVGL LOG CALLBACK =====
 
   // Display init code
   {
@@ -1905,6 +2073,9 @@ void setup()
         delay(500);
       }
     }
+    // DIAGNOSTIC: Save initial buffer address for integrity checks
+    buf_initial = buf;
+    LOG_INFO(TAG_SYS, "💾 PSRAM buf allocated at %p (%zu bytes)", buf, buffer_size);
 
     buf1 = (lv_color_t *)ps_malloc(buffer_size);
     if (buf1 == NULL)
@@ -1915,6 +2086,9 @@ void setup()
         delay(500);
       }
     }
+    // DIAGNOSTIC: Save initial buffer address for integrity checks
+    buf1_initial = buf1;
+    LOG_INFO(TAG_SYS, "💾 PSRAM buf1 allocated at %p (%zu bytes)", buf1, buffer_size);
 
     lv_disp_draw_buf_init(&draw_buf, buf, buf1, buffer_pixels);
     /*Initialize the display*/
@@ -1936,7 +2110,112 @@ void setup()
     indev_drv.read_cb = my_touchpad_read;
     lv_indev_drv_register(&indev_drv);
   }
+
+  // ===== CRITICAL: Turn on backlight BEFORE hardware test =====
+  // The test pattern must be visible when backlight is ON
+  // Previously, backlight was turned on AFTER UI rendering, making test pattern invisible
+  int LCDBrightness = map(brightness, 0, 100, 70, 256);
+  analogWrite(TFT_BL, LCDBrightness);
+  LOG_INFO(TAG_UI, "🔆 Backlight ON EARLY for hardware test: PWM=%d (brightness=%d%%)", LCDBrightness, brightness);
+  delay(100);  // Allow backlight to stabilize
+
+  // ===== DIAGNOSTIC: Display Hardware Test =====
+  // Test if display hardware is working BEFORE initializing UI
+  // This helps determine if the problem is display hardware or LVGL rendering
+  LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
+  LOG_INFO(TAG_UI, "  🔬 DISPLAY HARDWARE TEST");
+  LOG_INFO(TAG_UI, "  Drawing test pattern to verify SPI/display");
+  LOG_INFO(TAG_UI, "  🔆 BACKLIGHT IS NOW ON - SQUARES SHOULD BE VISIBLE");
+  LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
+
+  // Allocate buffer on HEAP (not stack!) to avoid heap corruption
+  #define TEST_SIZE 40
+  uint16_t* testPixels = (uint16_t*)malloc(TEST_SIZE * TEST_SIZE * sizeof(uint16_t));
+  if (testPixels == NULL) {
+    LOG_ERROR(TAG_UI, "❌ Failed to allocate test buffer - skipping hardware test");
+  } else {
+    // Test RED
+    for (int i = 0; i < TEST_SIZE * TEST_SIZE; i++) {
+      testPixels[i] = 0xF800;  // RGB565 red
+    }
+    LOG_INFO(TAG_UI, "Pushing %d red pixels to (10,10)...", TEST_SIZE * TEST_SIZE);
+    lcd_PushColors(10, 10, TEST_SIZE, TEST_SIZE, testPixels);
+    delay(50);
+
+    // Test GREEN
+    for (int i = 0; i < TEST_SIZE * TEST_SIZE; i++) {
+      testPixels[i] = 0x07E0;  // RGB565 green
+    }
+    LOG_INFO(TAG_UI, "Pushing %d green pixels to (60,10)...", TEST_SIZE * TEST_SIZE);
+    lcd_PushColors(60, 10, TEST_SIZE, TEST_SIZE, testPixels);
+    delay(50);
+
+    // Test BLUE
+    for (int i = 0; i < TEST_SIZE * TEST_SIZE; i++) {
+      testPixels[i] = 0x001F;  // RGB565 blue
+    }
+    LOG_INFO(TAG_UI, "Pushing %d blue pixels to (10,60)...", TEST_SIZE * TEST_SIZE);
+    lcd_PushColors(10, 60, TEST_SIZE, TEST_SIZE, testPixels);
+    delay(50);
+
+    free(testPixels);  // Free heap memory
+
+    LOG_INFO(TAG_UI, "✅ Hardware test complete - check for colored squares on display");
+    LOG_INFO(TAG_UI, "   Expected: RED at (10,10), GREEN at (60,10), BLUE at (10,60)");
+    LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
+
+    delay(2000);  // Hold test pattern for 2 seconds before UI init
+  }
+  // ===== END DIAGNOSTIC =====
+
   ui_init(); // initialized LVGL UI intereface
+
+  // ===== DIAGNOSTIC: LVGL Widget Tree Validation =====
+  LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
+  LOG_INFO(TAG_UI, "  🔬 LVGL WIDGET TREE VALIDATION");
+  LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
+
+  // Get active screen
+  lv_obj_t* activeScreen = lv_scr_act();
+  if (activeScreen) {
+    LOG_INFO(TAG_UI, "✅ Active screen exists at %p", activeScreen);
+
+    // Count child widgets
+    uint32_t childCount = lv_obj_get_child_cnt(activeScreen);
+    LOG_INFO(TAG_UI, "   Child widgets: %lu", childCount);
+
+    if (childCount == 0) {
+      LOG_ERROR(TAG_UI, "❌ WARNING: Active screen has NO child widgets!");
+      LOG_ERROR(TAG_UI, "   ui_init() may have failed to create UI elements");
+    }
+
+    // Force screen invalidation to trigger render
+    LOG_INFO(TAG_UI, "   Forcing screen invalidation to trigger render...");
+    lv_obj_invalidate(activeScreen);
+
+    // Check if screen is visible
+    if (lv_obj_has_flag(activeScreen, LV_OBJ_FLAG_HIDDEN)) {
+      LOG_ERROR(TAG_UI, "❌ WARNING: Active screen is HIDDEN!");
+    } else {
+      LOG_INFO(TAG_UI, "✅ Active screen is VISIBLE");
+    }
+  } else {
+    LOG_ERROR(TAG_UI, "❌ CRITICAL: No active screen! LVGL UI not initialized!");
+  }
+
+  // Check display driver
+  lv_disp_t* disp = lv_disp_get_default();
+  if (disp && disp->driver) {
+    LOG_INFO(TAG_UI, "✅ Display driver registered: %dx%d",
+             disp->driver->hor_res, disp->driver->ver_res);
+    LOG_INFO(TAG_UI, "   Draw buffer: %p (size: %lu pixels)",
+             disp->driver->draw_buf, disp->driver->draw_buf->size);
+  } else {
+    LOG_ERROR(TAG_UI, "❌ Display driver NOT registered!");
+  }
+
+  LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
+  // ===== END DIAGNOSTIC =====
 
   // CRITICAL: Mark LVGL as initialized - safe to call lv_timer_handler() now
   // This prevents crashes when BLE library tries to keep UI responsive during connection
@@ -1944,14 +2223,25 @@ void setup()
 
   // Force LVGL to render the first frame before turning on backlight
   // This prevents showing uninitialized frame buffer (noise/garbage)
+  LOG_INFO(TAG_UI, "Rendering initial UI frame before backlight ON...");
+
+  // CRITICAL FIX: Use lv_timer_handler() for LVGL v8 (lv_task_handler() was deprecated in v7)
   for (int i = 0; i < 10; i++) {
-    lv_task_handler();  // Process LVGL tasks to render UI
-    delay(5);           // Small delay to allow rendering to complete
+    lv_timer_handler();  // LVGL v8.x API (correct)
+    delay(5);            // Small delay to allow rendering to complete
   }
 
-  // NOW turn on backlight - UI is fully rendered and ready
-  int LCDBrightness = map(brightness, 0, 100, 70, 256); // brightness value is 0~100% have to map it out to pwm value.
-  analogWrite(TFT_BL, LCDBrightness);
+  // Verify LVGL display is properly initialized
+  disp = lv_disp_get_default();  // Reuse disp variable from widget validation above
+  if (disp && disp->driver) {
+    LOG_INFO(TAG_UI, "✅ LVGL display still valid after rendering: %dx%d",
+             disp->driver->hor_res, disp->driver->ver_res);
+  } else {
+    LOG_ERROR(TAG_UI, "❌ LVGL display NOT initialized - display will be blank!");
+  }
+
+  // NOTE: Backlight already turned ON earlier (before hardware test) - no need to turn on again
+  LOG_INFO(TAG_UI, "UI rendering complete - backlight already ON from hardware test phase");
 
   // initialized the Backlight Slider and Label Value
   lv_slider_set_value(ui_BacklightSlider, brightness, LV_ANIM_OFF);
@@ -2283,6 +2573,110 @@ void loop()
   //   - updateScaleReadings()
   //   - updateShotTimer()
   //   - handleShotWatchdogs()
+
+  // UI Health Monitor - Detects blank display and unresponsive touch issues
+  // This catches the problems that standard logging misses
+  static unsigned long lastUIHealthCheck = 0;
+  static unsigned long lastFlushDetected = 0;
+  static unsigned long lastTouchEventRecorded = 0;  // Will be updated from my_touchpad_read()
+  static bool uiHealthWarningShown = false;
+
+  if (millis() - lastUIHealthCheck > 30000) {  // Check every 30 seconds
+    unsigned long now = millis();
+    bool displayProblem = false;
+
+    // Check 1: Display flush happening? (even idle should flush occasionally)
+    // lastFlushTimestamp is updated in my_disp_flush() callback
+    if (lastFlushTimestamp > 0 && (now - lastFlushTimestamp) > 120000) {  // No flush for 2 minutes
+      LOG_ERROR(TAG_UI, "🚨 UI HEALTH: No display flush in 120s!");
+      displayProblem = true;
+    }
+
+    // Check 2: LVGL timer handler running?
+    if ((now - lastLVGLTimerCall) > 5000) {
+      LOG_ERROR(TAG_UI, "🚨 UI HEALTH: LVGL timer handler stopped for 5s!");
+      displayProblem = true;
+    }
+
+    // Check 3: Display driver still registered?
+    lv_disp_t* disp = lv_disp_get_default();
+    if (!disp || !disp->driver) {
+      LOG_ERROR(TAG_UI, "🚨 UI HEALTH: LVGL display driver MISSING!");
+      displayProblem = true;
+    }
+
+    // Check 4: Touch responsiveness (only warn if touch is expected but not working)
+    // NOTE: We don't warn about no touch - user may simply not be touching screen
+    // This is just for logging/debugging purposes
+
+    // ===== DIAGNOSTIC: LVGL Object Tree Validation =====
+    // Check if screen object and UI widgets still exist
+    if (disp != NULL) {
+      lv_obj_t* screen = lv_disp_get_scr_act(disp);
+      if (screen != NULL) {
+        uint32_t child_count = lv_obj_get_child_cnt(screen);
+        static uint32_t last_child_count = 0;
+
+        // Detect if widgets disappeared (object count dropped)
+        if (last_child_count > 0 && child_count < last_child_count) {
+          LOG_ERROR(TAG_UI, "🚨 WIDGETS DISAPPEARED! Count: %lu → %lu (lost %lu objects)",
+                   last_child_count, child_count, last_child_count - child_count);
+          displayProblem = true;
+        }
+
+        // Log object count every 5 checks (every 150 seconds)
+        static uint8_t object_check_counter = 0;
+        object_check_counter++;
+        if (object_check_counter >= 5) {
+          LOG_INFO(TAG_UI, "📊 LVGL Object Tree: %lu child objects on screen", child_count);
+          object_check_counter = 0;
+        }
+
+        last_child_count = child_count;
+      } else {
+        LOG_ERROR(TAG_UI, "🚨 Screen object is NULL!");
+        displayProblem = true;
+      }
+    }
+    // ===== END LVGL OBJECT TREE VALIDATION =====
+
+    // ===== DIAGNOSTIC: PSRAM Heap Monitoring =====
+    // Monitor PSRAM free space (icons/images stored in PSRAM buffers)
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t psram_min = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+    static uint8_t psram_check_counter = 0;
+    psram_check_counter++;
+    if (psram_check_counter >= 3) {  // Every 90 seconds
+      LOG_INFO(TAG_UI, "💾 PSRAM Heap: free=%zu KB, min_ever=%zu KB",
+               psram_free / 1024, psram_min / 1024);
+      psram_check_counter = 0;
+    }
+    // ===== END PSRAM MONITORING =====
+
+    // Periodic status logging
+    LOG_DEBUG(TAG_UI, "UI Health: Flush=%lums ago, Timer=%lums ago, Touch=%lums ago",
+              (lastFlushTimestamp > 0) ? (now - lastFlushTimestamp) : 999999,
+              now - lastLVGLTimerCall,
+              (lastTouchEvent > 0) ? (now - lastTouchEvent) : 999999);
+
+    if (displayProblem && !uiHealthWarningShown) {
+      LOG_ERROR(TAG_UI, "═════════════════════════════════════════════");
+      LOG_ERROR(TAG_UI, "  🚨 UI SYSTEM FAILURE DETECTED!");
+      LOG_ERROR(TAG_UI, "  Display may be blank or frozen");
+      LOG_ERROR(TAG_UI, "  Possible causes:");
+      LOG_ERROR(TAG_UI, "  - LVGL not initialized (check lv_timer_handler)");
+      LOG_ERROR(TAG_UI, "  - Display driver failed");
+      LOG_ERROR(TAG_UI, "  - SPI communication issue");
+      LOG_ERROR(TAG_UI, "  Check serial logs from setup() for errors");
+      LOG_ERROR(TAG_UI, "═════════════════════════════════════════════");
+      uiHealthWarningShown = true;
+    } else if (!displayProblem && uiHealthWarningShown) {
+      LOG_INFO(TAG_UI, "✅ UI health recovered");
+      uiHealthWarningShown = false;
+    }
+
+    lastUIHealthCheck = now;
+  }
 
   // CRITICAL: Yield CPU to prevent main loop from starving BLE task
   // Without this, main loop runs at 56,000 Hz and blocks BLE task

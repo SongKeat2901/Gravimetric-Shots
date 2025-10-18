@@ -447,17 +447,18 @@ ConnectionState AcaiaArduinoBLE::getConnectionState()
 const char* AcaiaArduinoBLE::getStateString()
 {
     switch (_connState) {
-        case CONN_IDLE:         return "Idle";
-        case CONN_SCANNING:     return "Scanning";
-        case CONN_CONNECTING:   return "Connecting";
-        case CONN_DISCOVERING:  return "Discovering";
-        case CONN_SUBSCRIBING:  return "Subscribing";
-        case CONN_IDENTIFYING:  return "Identifying";
-        case CONN_BATTERY:      return "Battery";
-        case CONN_NOTIFICATIONS: return "Notifications";
-        case CONN_CONNECTED:    return "Connected";
-        case CONN_FAILED:       return "Failed";
-        default:                return "Unknown";
+        case CONN_IDLE:           return "Idle";
+        case CONN_SCANNING:       return "Scanning";
+        case CONN_CONNECTING:     return "Connecting";
+        case CONN_DISCOVERING:    return "Discovering";
+        case CONN_SUBSCRIBING:    return "Subscribing";
+        case CONN_IDENTIFYING:    return "Identifying";
+        case CONN_BATTERY:        return "Battery";
+        case CONN_NOTIFICATIONS:  return "Notifications";
+        case CONN_CONNECTED:      return "Connected";
+        case CONN_FAILED:         return "Failed";
+        case CONN_RECONNECT_DELAY: return "Reconnect Delay";
+        default:                  return "Unknown";
     }
 }
 
@@ -771,7 +772,10 @@ bool AcaiaArduinoBLE::update()
     // }
 
     // Check for state timeout
-    if (_connState != CONN_IDLE && _connState != CONN_CONNECTED && _connState != CONN_FAILED)
+    // CRITICAL: Exclude CONN_RECONNECT_DELAY from timeout handling
+    // That state is SUPPOSED to timeout after 500ms (it's a non-blocking delay)
+    if (_connState != CONN_IDLE && _connState != CONN_CONNECTED &&
+        _connState != CONN_FAILED && _connState != CONN_RECONNECT_DELAY)
     {
         if (millis() - _connStateStart > _connTimeout)
         {
@@ -853,12 +857,21 @@ bool AcaiaArduinoBLE::update()
             _packetPeriod = 0;
             _lastHeartBeat = 0;
 
-            // STABILITY FIX: Delay before retry (increased from 100ms to 500ms)
+            // CRITICAL FIX: Non-blocking delay before retry
+            // Replaced blocking delay(500) with state machine delay
             // Gives scale adequate time to reset after disconnect
             // Especially important after identify/subscription failures
-            delay(500);
+            transitionTo(CONN_RECONNECT_DELAY, 500);  // 500ms non-blocking delay
+            break;
 
-            // Restart scan
+        case CONN_RECONNECT_DELAY:
+            // Non-blocking delay state - wait for timeout before restarting scan
+            // This prevents watchdog timeout from blocking delay() calls
+            if (millis() - _connStateStart < _connTimeout) {
+                break;  // Still waiting for 500ms delay to expire
+            }
+
+            // Delay expired - restart scan
             LOG_INFO(TAG, "Scan restarted (non-blocking reconnect)");
             _pScan = NimBLEDevice::getScan();
             if (_pScan) {

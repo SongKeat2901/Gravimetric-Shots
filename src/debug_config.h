@@ -104,6 +104,7 @@ typedef enum {
 #define LOG_LEVEL_UI      LOG_DEBUG   // UI/LVGL updates
 #define LOG_LEVEL_RELAY   LOG_DEBUG   // Relay control
 #define LOG_LEVEL_WEIGHT  LOG_DEBUG   // Weight updates
+#define LOG_LEVEL_LCD_DMA LOG_INFO    // Display DMA operations (lcd_PushColors calls)
 
 // ANSI color codes (prefixed with GS_ to avoid ESP-IDF conflicts)
 #define GS_COLOR_BLACK   "30"
@@ -143,6 +144,9 @@ inline log_level_t get_tag_log_level(const char* tag) {
 #endif
 #ifdef LOG_LEVEL_WEIGHT
     if (strcasecmp(tag, "Weight") == 0) return LOG_LEVEL_WEIGHT;
+#endif
+#ifdef LOG_LEVEL_LCD_DMA
+    if (strcasecmp(tag, "LCD_DMA") == 0) return LOG_LEVEL_LCD_DMA;
 #endif
 
     // Default to global level for unknown tags
