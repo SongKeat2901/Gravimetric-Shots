@@ -29,9 +29,10 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <ui.h>
-#include <AcaiaArduinoBLE.h>
-#include "esp_task_wdt.h" // Task watchdog for auto-recovery from hangs
-#include "nvs_flash.h"    // NVS initialization for WiFi+BLE coexistence
+#include <AcaiaArduinoBLE.h>  // Now uses NimBLE internally
+#include "NimBLEDevice.h"      // NimBLE for WiFi+BLE coexistence
+#include "esp_task_wdt.h"      // Task watchdog for auto-recovery from hangs
+#include "nvs_flash.h"         // NVS initialization for WiFi+BLE coexistence
 #include <Preferences.h>
 #include <cstring>
 
@@ -39,6 +40,14 @@
 #define XPOWERS_CHIP_SY6970
 #include <XPowersLib.h>
 XPowersPPM PMU;
+
+// Logging tags for different subsystems
+static const char* TAG_SYS   = "System";  // System messages (setup, init, memory)
+static const char* TAG_SCALE = "Scale";   // Scale connection and weight updates
+static const char* TAG_SHOT  = "Shot";    // Shot brewing process
+static const char* TAG_UI    = "UI";      // UI events (touch, display)
+static const char* TAG_RELAY = "Relay";   // Relay control
+static const char* TAG_TASK  = "Task";    // FreeRTOS task messages
 
 // -----------------------------------------------------------------------------
 // Display and Touch Configuration
@@ -104,7 +113,12 @@ const unsigned long TIMER_UPDATE_INTERVAL_MS = 100;  // 100ms = 0.1 second
 // Display sleep tracking and auto-wake
 bool displayAsleep = false;
 unsigned long lastTouchTime = 0;
+unsigned long lastWakeTime = 0;  // Timestamp when display woke up (to prevent phantom touches)
 const unsigned long DISPLAY_SLEEP_TIMEOUT_MS = 300000;  // 5 minutes idle = sleep
+const unsigned long WAKE_GUARD_MS = 1000;  // Ignore touches for 1 second after wake
+
+// LVGL initialization tracking (prevent crashes from calling lv_timer_handler before init)
+static bool lvglInitialized = false;
 
 // Thermal noise detection for touch controller
 static uint32_t edgeTouchCount = 0;
@@ -114,6 +128,94 @@ static uint32_t thermalSuppressionStart = 0;
 static const uint32_t EDGE_TOUCH_WINDOW_MS = 5000;  // 5-second window for counting edge touches
 static const uint32_t EDGE_TOUCH_THRESHOLD = 10;     // >10 edge touches = thermal noise
 static const uint32_t THERMAL_SUPPRESSION_DURATION_MS = 10000;  // Suppress for 10 seconds
+
+// -----------------------------------------------------------------------------
+// FreeRTOS Task Architecture - Professional Separation of BLE and UI
+// -----------------------------------------------------------------------------
+
+// BLE Task Handle
+TaskHandle_t bleTaskHandle = NULL;
+
+// Shared Data Structure - Protected by Mutex
+struct BLESharedData {
+    // Connection status
+    bool isConnected;
+    bool isConnecting;
+    char statusMessage[64];
+
+    // Weight data
+    float currentWeight;
+    float lastStableWeight;
+    unsigned long lastWeightUpdate;
+
+    // Scale info
+    int batteryLevel;
+    char scaleModel[32];
+
+    // Shot state
+    bool isBrewing;
+    unsigned long brewStartTime;
+
+    // Statistics
+    unsigned long connectionUptime;
+    unsigned long totalPacketsReceived;
+    unsigned long lastPacketTime;
+};
+
+BLESharedData bleData = {
+    false,  // isConnected
+    false,  // isConnecting
+    "Not Connected",  // statusMessage
+    0.0f,   // currentWeight
+    0.0f,   // lastStableWeight
+    0,      // lastWeightUpdate
+    0,      // batteryLevel
+    "",     // scaleModel
+    false,  // isBrewing
+    0,      // brewStartTime
+    0,      // connectionUptime
+    0,      // totalPacketsReceived
+    0       // lastPacketTime
+};
+
+SemaphoreHandle_t bleDataMutex = NULL;
+
+// Serial Print Mutex - Protect Serial.print() from thread collisions
+SemaphoreHandle_t serialMutex = NULL;
+
+// Command Queue - Main Loop to BLE Task
+enum BLECommand {
+    BLE_CMD_TARE,
+    BLE_CMD_START_TIMER,
+    BLE_CMD_STOP_TIMER,
+    BLE_CMD_RESET_TIMER,
+    BLE_CMD_DISCONNECT,
+    BLE_CMD_FORCE_RECONNECT
+};
+
+struct BLECommandMessage {
+    BLECommand command;
+    uint32_t param;  // Optional parameter
+};
+
+QueueHandle_t bleCommandQueue = NULL;
+
+// UI Update Queue - BLE Task to Main Loop (Professional Thread-Safe Pattern)
+// Follows same pattern as bleCommandQueue for consistency
+enum UIUpdateType {
+    UI_UPDATE_WEIGHT,
+    UI_UPDATE_TIMER,
+    UI_UPDATE_STATUS,
+    UI_UPDATE_CONNECTION
+};
+
+struct UIUpdateMessage {
+    UIUpdateType type;
+    char text[48];      // Large enough for any label text
+    bool boolValue;     // For connection status updates
+};
+
+QueueHandle_t uiUpdateQueue = NULL;
 
 // BLE command sequencer state machine (non-blocking)
 enum BLESequenceState {
@@ -158,8 +260,10 @@ struct Shot
 
 Shot shot;
 
-BLEService weightService("00002a98-0000-1000-8000-00805f9b34fb");
-BLEByteCharacteristic weightCharacteristic("0x2A98", BLEWrite | BLERead);
+// NimBLE Server objects (for advertising weight to external devices - optional)
+NimBLEServer* pServer = nullptr;
+NimBLEService* pWeightService = nullptr;
+NimBLECharacteristic* pWeightCharacteristic = nullptr;
 
 bool firstConnectionNotificationPending = true;
 bool BatteryLow                         = false;
@@ -202,8 +306,7 @@ static inline void setRelayState(bool high)
     return;
   relayState = high;
   digitalWrite(RELAY1, desired);
-  DEBUG_PRINT("Relay1 -> ");
-  DEBUG_PRINTLN(high ? "HIGH" : "LOW");
+  LOG_DEBUG(TAG_RELAY, "Relay1 -> %s", high ? "HIGH" : "LOW");
 }
 
 lv_obj_t *ui_cartext = nullptr;
@@ -212,14 +315,105 @@ lv_obj_t *ui_cartext = nullptr;
 // Helper Utilities
 // -----------------------------------------------------------------------------
 
+// UI Update Queue Functions (Professional Thread-Safe Pattern)
+// BLE task (Core 0) enqueues UI updates, Main loop (Core 1) dequeues and updates LVGL
+
+/**
+ * @brief Enqueue a UI update message (thread-safe, non-blocking)
+ * @param type Type of UI update (weight, timer, status, connection)
+ * @param text Text to display (for weight, timer, status updates)
+ * @note Called from BLE task (Core 0) - never touches LVGL directly!
+ */
+static inline void queueUIUpdate(UIUpdateType type, const char* text) {
+    UIUpdateMessage msg;
+    msg.type = type;
+    msg.boolValue = false;
+
+    if (text) {
+        strncpy(msg.text, text, sizeof(msg.text) - 1);
+        msg.text[sizeof(msg.text) - 1] = '\0';  // Ensure null termination
+    } else {
+        msg.text[0] = '\0';
+    }
+
+    // Non-blocking send - if queue is full, drop the message (UI updates are non-critical)
+    xQueueSend(uiUpdateQueue, &msg, 0);
+}
+
+/**
+ * @brief Enqueue a connection status update (thread-safe, non-blocking)
+ * @param connected true if scale is connected, false otherwise
+ * @note Called from BLE task (Core 0) - never touches LVGL directly!
+ */
+static inline void queueConnectionUpdate(bool connected) {
+    UIUpdateMessage msg;
+    msg.type = UI_UPDATE_CONNECTION;
+    msg.boolValue = connected;
+    msg.text[0] = '\0';
+
+    xQueueSend(uiUpdateQueue, &msg, 0);
+}
+
+/**
+ * @brief Process all pending UI updates from the queue (LVGL-safe, Core 1 only)
+ * @note Called from main loop (Core 1) - ONLY place that updates LVGL!
+ */
+static void processUIUpdates() {
+    UIUpdateMessage msg;
+
+    // Process all pending messages (non-blocking)
+    while (xQueueReceive(uiUpdateQueue, &msg, 0) == pdTRUE) {
+        switch (msg.type) {
+            case UI_UPDATE_WEIGHT:
+                if (ui_ScaleLabel) {
+                    lv_label_set_text(ui_ScaleLabel, msg.text);
+                }
+                break;
+
+            case UI_UPDATE_TIMER:
+                if (ui_TimerLabel) {
+                    lv_label_set_text(ui_TimerLabel, msg.text);
+                }
+                break;
+
+            case UI_UPDATE_STATUS:
+                if (ui_SerialLabel && ui_SerialLabel1) {
+                    lv_label_set_text(ui_SerialLabel, msg.text);
+                    lv_label_set_text(ui_SerialLabel1, msg.text);
+                }
+                // Also update local status text for consistency
+                strncpy(currentStatusText, msg.text, sizeof(currentStatusText) - 1);
+                currentStatusText[sizeof(currentStatusText) - 1] = '\0';
+                break;
+
+            case UI_UPDATE_CONNECTION:
+                if (ui_BluetoothImage1 && ui_BluetoothImage2) {
+                    if (msg.boolValue) {  // Connected
+                        _ui_state_modify(ui_BluetoothImage1, LV_STATE_DISABLED, _UI_MODIFY_STATE_REMOVE);
+                        _ui_state_modify(ui_BluetoothImage2, LV_STATE_DISABLED, _UI_MODIFY_STATE_REMOVE);
+                    } else {  // Disconnected
+                        _ui_state_modify(ui_BluetoothImage1, LV_STATE_DISABLED, _UI_MODIFY_STATE_ADD);
+                        _ui_state_modify(ui_BluetoothImage2, LV_STATE_DISABLED, _UI_MODIFY_STATE_ADD);
+                    }
+                }
+                break;
+        }
+    }
+}
+
 static inline void setStatusLabels(const char *text)
 {
   if (strcmp(currentStatusText, text) == 0)  // Fixed: proper string comparison
     return;
-  lv_label_set_text(ui_SerialLabel, text);
-  lv_label_set_text(ui_SerialLabel1, text);
-  strncpy(currentStatusText, text, sizeof(currentStatusText) - 1);  // Fixed: safe string copy
-  currentStatusText[sizeof(currentStatusText) - 1] = '\0';  // Ensure null termination
+
+  // PROFESSIONAL FIX: Use message queue for thread-safe UI updates
+  // BLE task (Core 0) enqueues message, main loop (Core 1) dequeues and updates LVGL
+  // This is the industry-standard pattern for LVGL multi-threading
+  queueUIUpdate(UI_UPDATE_STATUS, text);
+
+  // Keep local copy for comparison (prevents duplicate queue messages)
+  strncpy(currentStatusText, text, sizeof(currentStatusText) - 1);
+  currentStatusText[sizeof(currentStatusText) - 1] = '\0';
 }
 
 static inline void queueScaleStatus(const char *text)
@@ -259,13 +453,13 @@ static void updateDisplayRefreshRate(bool active_shot)
   {
     // Fast refresh during shot (16ms = 60Hz) for smooth weight updates
     lv_timer_set_period(refresh_timer, 16);
-    DEBUG_PRINTLN("Display: 60Hz (fast mode)");
+    LOG_DEBUG(TAG_UI, "Display: 60Hz (fast mode)");
   }
   else
   {
     // Normal refresh when idle (33ms = 30Hz) to save CPU/power
     lv_timer_set_period(refresh_timer, 33);
-    DEBUG_PRINTLN("Display: 30Hz (normal mode)");
+    LOG_DEBUG(TAG_UI, "Display: 30Hz (normal mode)");
   }
 }
 
@@ -288,9 +482,11 @@ static void updateShotTimer()
   {
     shot.shotTimer = seconds_f() - shot.start_timestamp_s;
 
+    // PROFESSIONAL FIX: Use message queue for thread-safe UI updates
+    // BLE task (Core 0) enqueues timer text, main loop (Core 1) updates LVGL
     char buffer[10];
     dtostrf(shot.shotTimer, 5, 1, buffer);
-    lv_label_set_text(ui_TimerLabel, buffer);
+    queueUIUpdate(UI_UPDATE_TIMER, buffer);
 
     lastTimerUpdate = now;
   }
@@ -313,7 +509,7 @@ static void handleBLESequence()
       break;
 
     case BLE_SEND_RESET:
-      DEBUG_PRINTLN("BLE: Sending RESET");
+      LOG_DEBUG(TAG_SHOT, "BLE: Sending RESET");
       if (!scale.resetTimer())
       {
         queueScaleStatus("Scale reset failed");
@@ -336,7 +532,7 @@ static void handleBLESequence()
       break;
 
     case BLE_SEND_TARE:
-      DEBUG_PRINTLN("BLE: Sending TARE");
+      LOG_DEBUG(TAG_SHOT, "BLE: Sending TARE");
       if (!scale.tare())
       {
         queueScaleStatus("Scale tare failed");
@@ -364,7 +560,7 @@ static void handleBLESequence()
       break;
 
     case BLE_SEND_START:
-      DEBUG_PRINTLN("BLE: Sending START");
+      LOG_DEBUG(TAG_SHOT, "BLE: Sending START");
       if (!scale.startTimer())
       {
         queueScaleStatus("Scale timer failed");
@@ -388,12 +584,12 @@ static void handleBLESequence()
       shot.brewing = true;
       bleSequenceInProgress = false;
 
-      DEBUG_PRINTLN("BLE: Starting shot - turning ON pump");
+      LOG_INFO(TAG_SHOT, "BLE: Starting shot - turning ON pump");
       setRelayState(true);              // Turn ON pump (relay)
       updateDisplayRefreshRate(true);   // 60Hz display mode
 
       bleSequenceState = BLE_IDLE;
-      DEBUG_PRINTLN("Shot started successfully!");
+      LOG_INFO(TAG_SHOT, "Shot started successfully!");
       break;
   }
 }
@@ -404,7 +600,7 @@ static void setBrewingState(bool brewing)
   {
     if (isFlushing)
     {
-      DEBUG_PRINTLN("Flushing cancelled due to brew start");
+      LOG_INFO(TAG_SHOT, "Flushing cancelled due to brew start");
       setRelayState(false);
       isFlushing = false;
     }
@@ -417,7 +613,7 @@ static void setBrewingState(bool brewing)
       return;
     }
 
-    DEBUG_PRINTLN("Shot start requested - triggering BLE sequence");
+    LOG_INFO(TAG_SHOT, "Shot start requested - triggering BLE sequence");
 
     // Trigger non-blocking BLE command sequence
     // Sequence: reset → tare → start → pump ON (handled by handleBLESequence)
@@ -427,7 +623,7 @@ static void setBrewingState(bool brewing)
   }
   else
   {
-    DEBUG_PRINTLN("ShotEnded");
+    LOG_INFO(TAG_SHOT, "ShotEnded");
     shot.end_s = seconds_f() - shot.start_timestamp_s;
     if (scale.isConnected())
     {
@@ -537,14 +733,77 @@ static void enforceRelayState()
 
   if (shouldBeHigh && actualState == LOW)
   {
-    DEBUG_PRINTLN("Relay corrected to HIGH");
+    LOG_WARN(TAG_RELAY, "Relay corrected to HIGH");
     setRelayState(true);
   }
   else if (!shouldBeHigh && actualState == HIGH)
   {
-    DEBUG_PRINTLN("Relay was HIGH unexpectedly, forcing LOW");
+    LOG_WARN(TAG_RELAY, "Relay was HIGH unexpectedly, forcing LOW");
     setRelayState(false);
   }
+}
+
+// -----------------------------------------------------------------------------
+// FreeRTOS Helper Functions - Safe Data Access
+// -----------------------------------------------------------------------------
+
+// Safe read from shared BLE data
+float readCurrentWeight() {
+    float weight = 0;
+    if (xSemaphoreTake(bleDataMutex, pdMS_TO_TICKS(10))) {
+        weight = bleData.currentWeight;
+        xSemaphoreGive(bleDataMutex);
+    }
+    return weight;
+}
+
+bool readConnectionStatus() {
+    bool connected = false;
+    if (xSemaphoreTake(bleDataMutex, pdMS_TO_TICKS(10))) {
+        connected = bleData.isConnected;
+        xSemaphoreGive(bleDataMutex);
+    }
+    return connected;
+}
+
+bool readConnectingStatus() {
+    bool connecting = false;
+    if (xSemaphoreTake(bleDataMutex, pdMS_TO_TICKS(10))) {
+        connecting = bleData.isConnecting;
+        xSemaphoreGive(bleDataMutex);
+    }
+    return connecting;
+}
+
+// Safe write to shared BLE data
+void updateSharedWeight(float weight) {
+    if (xSemaphoreTake(bleDataMutex, pdMS_TO_TICKS(10))) {
+        bleData.currentWeight = weight;
+        bleData.lastWeightUpdate = millis();
+        xSemaphoreGive(bleDataMutex);
+    }
+}
+
+void updateSharedConnectionStatus(bool connected, bool connecting) {
+    if (xSemaphoreTake(bleDataMutex, pdMS_TO_TICKS(10))) {
+        bleData.isConnected = connected;
+        bleData.isConnecting = connecting;
+        xSemaphoreGive(bleDataMutex);
+    }
+}
+
+void updateSharedStatusMessage(const char* message) {
+    if (xSemaphoreTake(bleDataMutex, pdMS_TO_TICKS(10))) {
+        strncpy(bleData.statusMessage, message, sizeof(bleData.statusMessage) - 1);
+        bleData.statusMessage[sizeof(bleData.statusMessage) - 1] = '\0';
+        xSemaphoreGive(bleDataMutex);
+    }
+}
+
+// Send command to BLE task
+bool sendBLECommand(BLECommand cmd, uint32_t param = 0) {
+    BLECommandMessage msg = {cmd, param};
+    return xQueueSend(bleCommandQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE;
 }
 
 // -----------------------------------------------------------------------------
@@ -576,6 +835,17 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
 uint8_t read_touchpad_cmd[11] = {0xb5, 0xab, 0xa5, 0x5a, 0x0, 0x0, 0x0, 0x8};
 void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
 {
+  // CRITICAL: Don't access I2C when display is asleep
+  // Touch controller (CST816 @ 0x3B) powers down with display
+  // Attempting I2C read causes: [E][Wire.cpp:513] requestFrom(): i2cRead returned Error -1
+  if (displayAsleep)
+  {
+    data->point.x = 0;
+    data->point.y = 0;
+    data->state = LV_INDEV_STATE_REL;  // Released (no touch)
+    return;  // Skip I2C access completely
+  }
+
   uint8_t buff[20] = {0};
   static bool haveLastPoint        = false;
   static lv_coord_t lastPointX     = 0;
@@ -590,8 +860,22 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
   Wire.write(read_touchpad_cmd, 8);
   Wire.endTransmission();
   Wire.requestFrom(0x3B, 8);
+
+  // CRITICAL: Add timeout protection to prevent infinite loop
+  // If touch controller doesn't respond within 100ms, return gracefully
+  unsigned long timeout_start = millis();
   while (!Wire.available())
-    ;
+  {
+    if (millis() - timeout_start > 100)  // 100ms timeout
+    {
+      // Timeout - no response from touch controller
+      data->point.x = 0;
+      data->point.y = 0;
+      data->state = LV_INDEV_STATE_REL;
+      return;
+    }
+  }
+
   Wire.readBytes(buff, 8);
 
   uint16_t rawX = AXS_GET_POINT_X(buff, 0);
@@ -620,7 +904,7 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
         if (!thermalSuppressionActive) {
           thermalSuppressionActive = true;
           thermalSuppressionStart = now;
-          DEBUG_PRINTLN("⚠️ THERMAL NOISE DETECTED - Suppressing left edge touches for 10s");
+          LOG_WARN(TAG_UI, "THERMAL NOISE DETECTED - Suppressing left edge touches for 10s");
         }
         edgeTouchCount = 0;  // Reset counter
       }
@@ -632,12 +916,12 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
       // End suppression after timeout
       if (now - thermalSuppressionStart > THERMAL_SUPPRESSION_DURATION_MS) {
         thermalSuppressionActive = false;
-        DEBUG_PRINTLN("✓ Thermal suppression ended");
+        LOG_INFO(TAG_UI, "Thermal suppression ended");
       }
       // Suppress left edge touches during thermal event
       else if (rawY < 50)
       {
-        DEBUG_PRINTLN("Left edge touch suppressed (thermal mode)");
+        LOG_VERBOSE(TAG_UI, "Left edge touch suppressed (thermal mode)");
         data->state = LV_INDEV_STATE_REL;
         return;
       }
@@ -647,16 +931,26 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
     // Wake display if asleep (touch-to-wake functionality)
     if (displayAsleep)
     {
-      DEBUG_PRINTLN("Touch detected - waking display");
+      LOG_DEBUG(TAG_UI, "Touch detected - waking display");
       lcd_wake();
 
       // Restore backlight to saved brightness level
       int LCDBrightness = map(brightness, 0, 100, 70, 256);
       analogWrite(TFT_BL, LCDBrightness);
-      DEBUG_PRINT("Backlight restored to ");
-      DEBUG_PRINTLN(brightness);
+      LOG_DEBUG(TAG_UI, "Backlight restored to %d", brightness);
 
       displayAsleep = false;
+      lastWakeTime = millis();  // Record wake time to guard against phantom touches
+    }
+
+    // GUARD: Ignore touch events within 1 second after wake (prevents phantom touches from I2C glitches)
+    if (lastWakeTime > 0 && (millis() - lastWakeTime) < WAKE_GUARD_MS)
+    {
+      // Still in wake guard period - reject this touch
+      data->point.x = 0;
+      data->point.y = 0;
+      data->state = LV_INDEV_STATE_REL;
+      return;
     }
 
     // Update last touch time for sleep timeout tracking
@@ -772,13 +1066,13 @@ void ui_event_FlushButton(lv_event_t *e)
 
       // Reject touches too close to left edge (thermal drift zone)
       if (pressX < 5) {
-        DEBUG_PRINTLN("Flush: Rejected edge touch (X < 5px)");
+        LOG_DEBUG(TAG_UI, "Flush: Rejected edge touch (X < 5px)");
         pressedAt = 0;  // Invalidate press
         return;
       }
     }
 
-    DEBUG_PRINTLN("Flush button PRESSED");
+    LOG_DEBUG(TAG_UI, "Flush button PRESSED");
     return;
   }
 
@@ -793,9 +1087,7 @@ void ui_event_FlushButton(lv_event_t *e)
         return;
       }
 
-      DEBUG_PRINT("Flush activated (");
-      DEBUG_PRINT(millis() - pressedAt);
-      DEBUG_PRINTLN("ms press)");
+      LOG_INFO(TAG_UI, "Flush activated (%lums press)", millis() - pressedAt);
 
       flushingFeature();
     }
@@ -803,9 +1095,7 @@ void ui_event_FlushButton(lv_event_t *e)
   }
   else if (event_code == LV_EVENT_CLICKED && pressedAt > 0)
   {
-    DEBUG_PRINT("Flush REJECTED - press too short (");
-    DEBUG_PRINT(millis() - pressedAt);
-    DEBUG_PRINTLN("ms)");
+    LOG_DEBUG(TAG_UI, "Flush REJECTED - press too short (%lums)", millis() - pressedAt);
     pressedAt = 0;
   }
 }
@@ -900,8 +1190,7 @@ void ui_event_BacklightSlider(lv_event_t *e)
     int brightnessValue = lv_slider_get_value(target);
     brightness = map(brightnessValue, 0, 100, 70, 255);
     saveBrightness(brightnessValue); // Save 0-100% brightness value
-    DEBUG_PRINT("Brightness value saved @ ");
-    DEBUG_PRINTLN(brightnessValue);
+    LOG_DEBUG(TAG_UI, "Brightness value saved @ %d", brightnessValue);
     analogWrite(TFT_BL, brightness); // PWM based on 0-255
   }
 }
@@ -942,7 +1231,7 @@ void flushingFeature()
   setRelayState(true);          // Turn on the output pin
   startTimeFlushing = millis(); // Record the current time
   isFlushing = true;            // Set the flushing flag
-  DEBUG_PRINTLN("Flushing started");
+  LOG_INFO(TAG_UI, "Flushing started");
   enforceRelayState();
 }
 
@@ -990,16 +1279,13 @@ void checkScaleStatus()
   bool connected = scale.isConnected();
   uint32_t now   = millis();
 
-  if (!ui_BluetoothImage1 || !ui_BluetoothImage2 || !ui_SerialLabel)
-  {
-    lastScaleConnected = connected;
-    return;
-  }
+  // CRITICAL: This function runs in BLE task (Core 0)
+  // CANNOT access LVGL UI elements - they're not thread-safe!
+  // UI updates are handled by main loop reading shared data
 
   if (!connected)
   {
-    _ui_state_modify(ui_BluetoothImage1, LV_STATE_DISABLED, _UI_MODIFY_STATE_ADD);
-    _ui_state_modify(ui_BluetoothImage2, LV_STATE_DISABLED, _UI_MODIFY_STATE_ADD);
+    // UI updates removed - handled by updateUIWithBLEData() on Core 1
 
     if (!hasEverConnectedToScale)
     {
@@ -1032,7 +1318,7 @@ void checkScaleStatus()
       if (scale.update())
       {
         // Connection successful!
-        Serial.println("checkScaleStatus: Scale fully connected!");
+        LOG_INFO(TAG_SCALE, "Scale fully connected!");
         queueScaleStatus("Scale connected");
         firstConnectionNotificationPending = true;
       }
@@ -1049,8 +1335,7 @@ void checkScaleStatus()
   }
   else
   {
-    _ui_state_modify(ui_BluetoothImage1, LV_STATE_DISABLED, _UI_MODIFY_STATE_REMOVE);
-    _ui_state_modify(ui_BluetoothImage2, LV_STATE_DISABLED, _UI_MODIFY_STATE_REMOVE);
+    // UI updates removed - handled by updateUIWithBLEData() on Core 1
 
     if (!lastScaleConnected)
     {
@@ -1098,9 +1383,7 @@ static void handleFlushingCycle()
       hasPendingScaleStatus = true;
     }
 
-    DEBUG_PRINT("Flushing... ");
-    DEBUG_PRINT(remaining / 1000);
-    DEBUG_PRINTLN(" seconds remaining");
+    LOG_DEBUG(TAG_UI, "Flushing... %lu seconds remaining", remaining / 1000);
 
     char labelBuf[48];
     snprintf(labelBuf, sizeof(labelBuf), "Flushing... %lu seconds remaining", remaining / 1000);
@@ -1111,7 +1394,7 @@ static void handleFlushingCycle()
   {
     setRelayState(false);
     isFlushing = false;
-    DEBUG_PRINTLN("Flushing ended");
+    LOG_INFO(TAG_UI, "Flushing ended");
     setStatusLabels("Flushing ended");
 
     flushMessageActive    = true;
@@ -1141,15 +1424,35 @@ static void updateScaleReadings()
 
   currentWeight = scale.getWeight();
 
+  // PROFESSIONAL FIX: Use message queue for thread-safe UI updates
+  // BLE task (Core 0) enqueues weight text, main loop (Core 1) updates LVGL
   char buffer[10];
   dtostrf(currentWeight, 5, 1, buffer);
-  lv_label_set_text(ui_ScaleLabel, buffer);
+  queueUIUpdate(UI_UPDATE_WEIGHT, buffer);
 
-  DEBUG_PRINT(currentWeight);
+  // Rate limit weight printing to prevent WebSocket overflow
+  // Only print every 100ms OR when weight changes by >0.1g
+  static unsigned long lastWeightPrint = 0;
+  static float lastPrintedWeight = 0;
+  const unsigned long WEIGHT_PRINT_INTERVAL = 100;  // 100ms = 10Hz (was 10ms = 100Hz)
+
+  bool shouldPrint = false;
+  unsigned long now = millis();
+
+  if (now - lastWeightPrint >= WEIGHT_PRINT_INTERVAL) {
+    shouldPrint = true;  // Time-based: print every 100ms
+  } else if (abs(currentWeight - lastPrintedWeight) > 0.1) {
+    shouldPrint = true;  // Change-based: significant weight change (>0.1g)
+  }
+
+  if (shouldPrint) {
+    LOG_VERBOSE(TAG_SHOT, "%.2fg", currentWeight);
+    lastWeightPrint = now;
+    lastPrintedWeight = currentWeight;
+  }
 
   if (!shot.brewing)
   {
-    DEBUG_PRINTLN("");
     return;
   }
 
@@ -1162,7 +1465,7 @@ static void updateScaleReadings()
     std::memmove(shot.time_s,   shot.time_s + 1,   shot.datapoints * sizeof(float));
     std::memmove(shot.weight,   shot.weight + 1,   shot.datapoints * sizeof(float));
 
-    DEBUG_PRINTLN("Shot history buffer full, oldest datapoint discarded");
+    LOG_WARN(TAG_SHOT, "Shot history buffer full, oldest datapoint discarded");
   }
 
   const float nowSeconds = seconds_f() - shot.start_timestamp_s;
@@ -1171,20 +1474,17 @@ static void updateScaleReadings()
   shot.shotTimer                = nowSeconds;
   shot.datapoints++;
 
-  DEBUG_PRINT(" ");
-  DEBUG_PRINT(shot.shotTimer);
-
   // Timer display now updated independently by updateShotTimer() function
 
   calculateEndTime(&shot);
-  DEBUG_PRINT(" ");
-  DEBUG_PRINT(shot.expected_end_s);
+
+  if (shouldPrint) {
+    LOG_VERBOSE(TAG_SHOT, "Timer: %.1fs, Expected end: %.1fs", shot.shotTimer, shot.expected_end_s);
+  }
 
   char labelBuf[40];
   snprintf(labelBuf, sizeof(labelBuf), "Expected end time @ %.1f s", shot.expected_end_s);
   setStatusLabels(labelBuf);
-
-  DEBUG_PRINTLN("");
 }
 
 static void handleShotWatchdogs()
@@ -1202,14 +1502,14 @@ static void handleShotWatchdogs()
 
   if (shot.brewing && shot.shotTimer > MAX_SHOT_DURATION_S)
   {
-    DEBUG_PRINTLN("Max brew duration reached");
+    LOG_WARN(TAG_SHOT, "Max brew duration reached");
     setStatusLabels("Max brew duration reached");
     stopBrew(false, TIME_EXCEEDED);
   }
 
   if (shot.brewing && shot.shotTimer >= shot.expected_end_s && shot.shotTimer > MIN_SHOT_DURATION_S)
   {
-    DEBUG_PRINTLN("weight achieved");
+    LOG_INFO(TAG_SHOT, "Weight achieved");
     setStatusLabels("Weight achieved");
     stopBrew(false, WEIGHT_ACHIEVED);
   }
@@ -1220,27 +1520,19 @@ static void handleShotWatchdogs()
     shot.start_timestamp_s = 0;
     shot.end_s             = 0;
 
-    DEBUG_PRINT("I detected a final weight of ");
-    DEBUG_PRINT(currentWeight);
-    DEBUG_PRINT("g. The goal was ");
-    DEBUG_PRINT(goalWeight);
-    DEBUG_PRINT("g with a negative offset of ");
-    DEBUG_PRINT(weightOffset);
-
     if (abs(currentWeight - goalWeight + weightOffset) > MAX_OFFSET)
     {
-      DEBUG_PRINT("g. Error assumed. Offset unchanged. ");
+      LOG_INFO(TAG_SHOT, "Final weight: %.2fg, Goal: %dg, Offset: %.2fg - Error assumed. Offset unchanged.",
+               currentWeight, goalWeight, weightOffset);
       setStatusLabels("Error assumed. Offset unchanged.");
     }
     else
     {
-      DEBUG_PRINT("g. Next time I'll create an offset of ");
       weightOffset += currentWeight - goalWeight;
-      DEBUG_PRINT(weightOffset);
+      LOG_INFO(TAG_SHOT, "Final weight: %.2fg, Goal: %dg, New offset: %.2fg",
+               currentWeight, goalWeight, weightOffset);
       saveOffset(static_cast<int>(weightOffset * 10.0f));
     }
-
-    DEBUG_PRINTLN("");
   }
 }
 
@@ -1249,6 +1541,11 @@ extern size_t lcd_PushColors_len;
 
 void LVGLTimerHandlerRoutine()
 {
+  // CRITICAL: Don't call lv_timer_handler() before LVGL is initialized
+  // This prevents crashes when BLE library calls this during early boot
+  if (!lvglInitialized)
+    return;
+
   if (transfer_num <= 0 && lcd_PushColors_len <= 0)
     lv_timer_handler();
 
@@ -1264,7 +1561,17 @@ void LVGLTimerHandlerRoutine()
 
 void setup()
 {
-  // Initialize NVS (Non-Volatile Storage) FIRST - before WiFi or BLE
+  // =============================================================================
+  // Boot Sequence (order is CRITICAL for WiFi+BLE coexistence)
+  // =============================================================================
+  // 0. NVS init - MUST be first (prevents double-init crash)
+  // 1. Serial.begin() - For early boot messages
+  // 2. Create serialMutex - Required before any LOG_*() calls
+  // 3. NimBLE init - Must claim radio BEFORE WiFi
+  // 4. DEBUG_INIT() - WiFi setup (debug builds only), re-calls Serial.begin() safely
+  // =============================================================================
+
+  // Step 0: Initialize NVS (Non-Volatile Storage) FIRST - before WiFi or BLE
   // This prevents both radios from trying to initialize NVS independently
   // Critical for WiFi+BLE coexistence on ESP32-S3
   esp_err_t ret = nvs_flash_init();
@@ -1273,10 +1580,41 @@ void setup()
     nvs_flash_init();
   }
 
-  DEBUG_INIT();  // Initializes Serial (production) or WiFi+WebSerial (debug builds)
-  delay(500); // Reduced from 5000ms - just enough for serial init, won't cause black screen on direct power
+  // Step 1: Initialize Serial (production builds need this, debug builds will re-init)
+  Serial.begin(115200);
+  delay(500);  // Delay for Serial to stabilize (increased for reliability)
 
-  DEBUG_PRINTLN("=== Gravimetric Shots Initializing ===");
+  // Step 2: Create serial mutex BEFORE any LOG_*() calls
+  // This prevents output fragmentation when multiple tasks print simultaneously
+  serialMutex = xSemaphoreCreateMutex();
+  if (serialMutex == NULL) {
+    // CRITICAL: Can't use LOG_*() here - mutex creation failed!
+    // This is the ONLY place where raw Serial.println() is acceptable
+    Serial.println("\n\n=== BOOT FAILURE ===");
+    Serial.println("[FATAL] Failed to create serialMutex!");
+    Serial.println("System halted - restart required");
+    while(1) delay(1000);  // Halt - critical failure
+  }
+
+  // Mutex created successfully - can now use LOG_*() macros safely
+  LOG_INFO(TAG_SYS, "");
+  LOG_INFO(TAG_SYS, "=== BOOT START ===");
+  LOG_INFO(TAG_SYS, "Serial initialized @ 115200 baud");
+  LOG_INFO(TAG_SYS, "FreeRTOS mutex created successfully");
+
+  // Step 3: Initialize NimBLE BEFORE WiFi (critical for radio coexistence)
+  LOG_INFO(TAG_SYS, "");
+  LOG_INFO(TAG_SYS, "=== Initializing NimBLE (BEFORE WiFi) ===");
+  NimBLEDevice::init("GravimetricShots");
+  LOG_INFO(TAG_SYS, "NimBLE initialized - radio claimed by BLE stack");
+
+  // Step 4: Initialize WiFi (debug builds only) via DEBUG_INIT()
+  // NimBLE is already running, WiFi will coexist properly
+  // Note: DEBUG_INIT() calls Serial.begin() again - this is safe (no-op on already-initialized serial)
+  DEBUG_INIT();  // Production: no-op, Debug builds: WiFi+WebSerial setup
+  delay(500);    // Brief delay for WiFi connection (if enabled)
+
+  LOG_INFO(TAG_SYS, "=== Gravimetric Shots Initializing ===");
 
   // Initialize PMU (Power Management Unit) for LED control
   // T-Display-S3-Long uses SY6970 on I2C pins: SDA=15, SCL=10 (same as touch)
@@ -1285,17 +1623,17 @@ void setup()
   if (PMU.init(Wire, TOUCH_IICSDA, TOUCH_IICSCL, SY6970_SLAVE_ADDRESS))
   {
     PMU.disableStatLed();  // Turn off green charging indicator LED
-    DEBUG_PRINTLN("PMU initialized, status LED disabled");
+    LOG_INFO(TAG_SYS, "PMU initialized, status LED disabled");
   }
   else
   {
-    DEBUG_PRINTLN("PMU init failed (LED control unavailable)");
+    LOG_WARN(TAG_SYS, "PMU init failed (LED control unavailable)");
   }
 
   // Initialize task watchdog (10 second timeout) - auto-reboot on hang
   esp_task_wdt_init(10, true);  // 10s timeout, panic & reboot on trigger
   esp_task_wdt_add(NULL);       // Add current task to watchdog
-  DEBUG_PRINTLN("Task watchdog enabled (10s timeout)");
+  LOG_INFO(TAG_SYS, "Task watchdog enabled (10s timeout)");
 
   preferences.begin("myApp", false);                       // Open the preferences with a namespace and read-only flag
   brightness = preferences.getInt(BRIGHTNESS_KEY, 0);      // Read the brightness value from preferences
@@ -1303,35 +1641,26 @@ void setup()
   weightOffset = preferences.getInt(OFFSET_KEY, 0) / 10.0; // Read the offset value from preferences
   preferences.end();                                       // Close the preferences
 
-  DEBUG_PRINT("Brightness read from preferences: ");
-  DEBUG_PRINTLN(brightness);
-  DEBUG_PRINT("Goal Weight retrieved: ");
-  DEBUG_PRINTLN(goalWeight);
-  DEBUG_PRINT("Offset retrieved: ");
-  DEBUG_PRINTLN(weightOffset);
+  LOG_DEBUG(TAG_SYS, "Brightness read from preferences: %d", brightness);
+  LOG_DEBUG(TAG_SYS, "Goal Weight retrieved: %d", goalWeight);
+  LOG_DEBUG(TAG_SYS, "Offset retrieved: %.1f", weightOffset);
 
   if ((goalWeight < 10) || (goalWeight > 200)) // If preferences isn't initialized and has an unreasonable weight/offset, default to 36g/1.5g
   {
     goalWeight = 36;
-    char debugBuf[64];
-    snprintf(debugBuf, sizeof(debugBuf), "Goal Weight set to: %d g", goalWeight);
-    DEBUG_PRINTLN(debugBuf);
+    LOG_INFO(TAG_SYS, "Goal Weight set to: %d g", goalWeight);
   }
 
   if (weightOffset > MAX_OFFSET)
   {
     weightOffset = 1.5;
-    char debugBuf[64];
-    snprintf(debugBuf, sizeof(debugBuf), "Offset set to: %.1f g", weightOffset);
-    DEBUG_PRINTLN(debugBuf);
+    LOG_INFO(TAG_SYS, "Offset set to: %.1f g", weightOffset);
   }
 
   if ((brightness < 0) || (brightness > 100)) // If preferences isn't initialized set brightness to 50%
   {
     brightness = 50;
-    char debugBuf[64];
-    snprintf(debugBuf, sizeof(debugBuf), "Backlight set to: Default @ %d %%", brightness);
-    DEBUG_PRINTLN(debugBuf);
+    LOG_INFO(TAG_SYS, "Backlight set to: Default @ %d %%", brightness);
   }
 
   // initialize the GPIO hardware
@@ -1340,15 +1669,28 @@ void setup()
   relayState = true; // force update on first set
   setRelayState(false);
 
-  // initialize the Bluetooth® Low Energy hardware
-  BLE.begin();
-  BLE.setLocalName("shotStopper");
-  BLE.setAdvertisedService(weightService);
-  weightService.addCharacteristic(weightCharacteristic);
-  BLE.addService(weightService);
-  weightCharacteristic.writeValue(36);
-  BLE.advertise();
-  DEBUG_PRINTLN("Bluetooth® device active, waiting for connections...");
+  // NimBLE already initialized early in setup() (before WiFi)
+  // Create BLE server to advertise weight to external devices (optional)
+  LOG_DEBUG(TAG_SYS, "Creating NimBLE server for weight advertising...");
+  pServer = NimBLEDevice::createServer();
+  if (pServer) {
+    pWeightService = pServer->createService("00002a98-0000-1000-8000-00805f9b34fb");
+    if (pWeightService) {
+      pWeightCharacteristic = pWeightService->createCharacteristic(
+        "0x2A98",
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE
+      );
+      if (pWeightCharacteristic) {
+        uint8_t initialValue = 36;
+        pWeightCharacteristic->setValue(&initialValue, 1);
+      }
+      pWeightService->start();
+    }
+    NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID("00002a98-0000-1000-8000-00805f9b34fb");
+    pAdvertising->start();
+    LOG_INFO(TAG_SYS, "NimBLE server ready");
+  }
 
   pinMode(TOUCH_RES, OUTPUT);
   digitalWrite(TOUCH_RES, HIGH);
@@ -1367,6 +1709,7 @@ void setup()
   axs15231_init(); // initialized Screen
 
   lv_init(); // initialized LVGL
+
   // Display init code
   {
     size_t buffer_pixels = EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES;
@@ -1376,7 +1719,7 @@ void setup()
     {
       while (1)
       {
-        DEBUG_PRINTLN("buf NULL");
+        LOG_ERROR(TAG_SYS, "buf NULL - PSRAM allocation failed!");
         delay(500);
       }
     }
@@ -1386,7 +1729,7 @@ void setup()
     {
       while (1)
       {
-        DEBUG_PRINTLN("buf NULL");
+        LOG_ERROR(TAG_SYS, "buf1 NULL - PSRAM allocation failed!");
         delay(500);
       }
     }
@@ -1412,6 +1755,10 @@ void setup()
     lv_indev_drv_register(&indev_drv);
   }
   ui_init(); // initialized LVGL UI intereface
+
+  // CRITICAL: Mark LVGL as initialized - safe to call lv_timer_handler() now
+  // This prevents crashes when BLE library tries to keep UI responsive during connection
+  lvglInitialized = true;
 
   // Force LVGL to render the first frame before turning on backlight
   // This prevents showing uninitialized frame buffer (noise/garbage)
@@ -1439,41 +1786,259 @@ void setup()
   lv_label_set_text(ui_PresetWeightLabel, prefixedBuffer);
 
 
-  DEBUG_PRINT("Flash size: "); DEBUG_PRINT(ESP.getFlashChipSize()); DEBUG_PRINTLN(" bytes");
-  DEBUG_PRINT("App partition: "); DEBUG_PRINT(ESP.getSketchSize()); DEBUG_PRINT(" used / "); DEBUG_PRINT(ESP.getSketchSize() + ESP.getFreeSketchSpace()); DEBUG_PRINTLN(" bytes total");
-  DEBUG_PRINT("Heap total: "); DEBUG_PRINT(ESP.getHeapSize()); DEBUG_PRINT(" bytes, free: "); DEBUG_PRINT(ESP.getFreeHeap()); DEBUG_PRINTLN(" bytes");
-  DEBUG_PRINT("PSRAM total: "); DEBUG_PRINT(ESP.getPsramSize()); DEBUG_PRINT(" bytes, free: "); DEBUG_PRINT(ESP.getFreePsram()); DEBUG_PRINTLN(" bytes");
-  DEBUG_PRINTLN("Setup Completed");
+  LOG_INFO(TAG_SYS, "Flash size: %u bytes", ESP.getFlashChipSize());
+  LOG_INFO(TAG_SYS, "App partition: %u used / %u bytes total", ESP.getSketchSize(), ESP.getSketchSize() + ESP.getFreeSketchSpace());
+  LOG_INFO(TAG_SYS, "Heap total: %u bytes, free: %u bytes", ESP.getHeapSize(), ESP.getFreeHeap());
+  LOG_INFO(TAG_SYS, "PSRAM total: %u bytes, free: %u bytes", ESP.getPsramSize(), ESP.getFreePsram());
+  LOG_INFO(TAG_SYS, "Setup Completed");
 
   // Initialize touch time tracking
   lastTouchTime = millis();
+
+  // Create FreeRTOS mutex and queue
+  bleDataMutex = xSemaphoreCreateMutex();
+  if (bleDataMutex == NULL) {
+    LOG_ERROR(TAG_TASK, "Failed to create bleDataMutex!");
+    while(1) delay(1000);  // Halt - critical failure
+  }
+
+  bleCommandQueue = xQueueCreate(10, sizeof(BLECommandMessage));
+  if (bleCommandQueue == NULL) {
+    LOG_ERROR(TAG_TASK, "Failed to create bleCommandQueue!");
+    while(1) delay(1000);  // Halt - critical failure
+  }
+
+  uiUpdateQueue = xQueueCreate(20, sizeof(UIUpdateMessage));
+  if (uiUpdateQueue == NULL) {
+    LOG_ERROR(TAG_TASK, "Failed to create uiUpdateQueue!");
+    while(1) delay(1000);  // Halt - critical failure
+  }
+
+  // Create BLE task on Core 0 (BLE/WiFi core)
+  LOG_INFO(TAG_TASK, "Creating BLE task on Core 0...");
+
+  xTaskCreatePinnedToCore(
+      bleTaskFunction,       // Task function
+      "BLE_Task",            // Task name
+      20480,                 // Stack size (20KB - increased from 16KB)
+      NULL,                  // Parameters
+      2,                     // Priority (higher than main loop = 1)
+      &bleTaskHandle,        // Task handle
+      0                      // Core 0 (BLE/WiFi core)
+  );
+
+  // Wait for BLE task to print its startup message (avoid serial collision)
+  vTaskDelay(pdMS_TO_TICKS(500));
+
+  LOG_INFO(TAG_TASK, "BLE task created successfully, main loop on Core %d", xPortGetCoreID());
 }
 
+// -----------------------------------------------------------------------------
+// BLE Task - Runs on Core 0 (BLE/WiFi Core)
+// -----------------------------------------------------------------------------
+
+// Process commands from main loop
+void processBLECommand(BLECommandMessage& cmd)
+{
+    switch (cmd.command)
+    {
+        case BLE_CMD_TARE:
+            LOG_DEBUG(TAG_TASK, "Command: TARE");
+            bleSequenceState = BLE_SEND_TARE;
+            bleSequenceInProgress = true;
+            break;
+
+        case BLE_CMD_START_TIMER:
+            LOG_DEBUG(TAG_TASK, "Command: START_TIMER");
+            bleSequenceState = BLE_SEND_START;
+            bleSequenceInProgress = true;
+            break;
+
+        case BLE_CMD_STOP_TIMER:
+            LOG_DEBUG(TAG_TASK, "Command: STOP_TIMER");
+            // Implement stop logic if needed
+            break;
+
+        case BLE_CMD_RESET_TIMER:
+            LOG_DEBUG(TAG_TASK, "Command: RESET_TIMER");
+            bleSequenceState = BLE_SEND_RESET;
+            bleSequenceInProgress = true;
+            break;
+
+        case BLE_CMD_DISCONNECT:
+            LOG_DEBUG(TAG_TASK, "Command: DISCONNECT");
+            // scale.disconnect();  // Implement if needed
+            break;
+
+        case BLE_CMD_FORCE_RECONNECT:
+            LOG_DEBUG(TAG_TASK, "Command: FORCE_RECONNECT");
+            // Force reconnection logic
+            break;
+    }
+}
+
+// BLE Task Function - Runs continuously on Core 0
+void bleTaskFunction(void* parameter)
+{
+    // Get core ID and verify correct assignment
+    uint8_t coreID = xPortGetCoreID();
+
+    // Wait to avoid serial collision with setup()
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    LOG_INFO(TAG_TASK, "=================================");
+    LOG_INFO(TAG_TASK, "Running on Core: %d", coreID);
+
+    if (coreID != 0) {
+        LOG_WARN(TAG_TASK, "WARNING: Should be on Core 0, but running on Core 1!");
+        LOG_WARN(TAG_TASK, "Task pinning may have failed!");
+    } else {
+        LOG_INFO(TAG_TASK, "Core assignment correct!");
+    }
+
+    // Check initial stack size
+    UBaseType_t stackSize = uxTaskGetStackHighWaterMark(NULL);
+    LOG_INFO(TAG_TASK, "Stack allocated: 20KB, available: %u bytes", stackSize);
+    LOG_INFO(TAG_TASK, "=================================");
+
+    // CRITICAL: Add this BLE task to the watchdog
+    // This task MUST call esp_task_wdt_reset() regularly or system will reboot
+    esp_task_wdt_add(NULL);  // Add current task (BLE task) to watchdog
+    LOG_INFO(TAG_TASK, "BLE task added to watchdog monitor");
+
+    // Track stack usage
+    unsigned long lastStackCheck = 0;
+
+    while (true)
+    {
+        // Reset watchdog at start of each iteration
+        esp_task_wdt_reset();
+
+        // Process commands from main loop (non-blocking check)
+        BLECommandMessage cmd;
+        if (xQueueReceive(bleCommandQueue, &cmd, 0) == pdTRUE) {
+            processBLECommand(cmd);
+        }
+
+        // Run scale state machine (blocking operations happen here - that's OK!)
+        if (scale.isConnecting()) {
+            scale.update();  // This can block for seconds - doesn't affect UI!
+        }
+
+        // Check scale status and manage connection
+        checkScaleStatus();
+
+        // Send heartbeat to keep connection alive
+        checkHeartBreat();
+
+        // Handle BLE command sequence (tare, start timer, etc.)
+        handleBLESequence();
+
+        // Update weight readings
+        updateScaleReadings();
+
+        // Update shot timer (independent 0.1s updates)
+        updateShotTimer();
+
+        // Handle shot watchdogs
+        handleShotWatchdogs();
+
+        // Update shared data for main loop
+        updateSharedConnectionStatus(scale.isConnected(), scale.isConnecting());
+        updateSharedWeight(currentWeight);
+
+        // Monitor stack usage every 10 seconds
+        if (millis() - lastStackCheck > 10000) {
+            UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(NULL);
+            LOG_VERBOSE(TAG_TASK, "Stack watermark: %u bytes remaining", stackLeft);
+
+            if (stackLeft < 1000) {
+                LOG_WARN(TAG_TASK, "WARNING: Low stack! Consider increasing stack size!");
+            }
+
+            lastStackCheck = millis();
+        }
+
+        // Small delay to prevent task starvation (10ms)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// Update UI with data from BLE task (runs on Core 1)
+// NOTE: Weight/timer/status updates use message queue (processUIUpdates)
+// This function reads shared data for global variables (currentWeight, connection status)
+void updateUIWithBLEData()
+{
+    static unsigned long lastUIUpdate = 0;
+    static bool lastKnownConnectionState = false;
+
+    if (millis() - lastUIUpdate < 50) return;  // Update UI every 50ms max
+
+    // Read shared data from BLE task
+    if (xSemaphoreTake(bleDataMutex, pdMS_TO_TICKS(5))) {
+        // CRITICAL: Update currentWeight for shot logic and touch handlers
+        currentWeight = bleData.currentWeight;
+
+        bool connected = bleData.isConnected;
+        xSemaphoreGive(bleDataMutex);
+
+        // Only queue connection update if state changed (avoid flooding queue)
+        if (connected != lastKnownConnectionState) {
+            queueConnectionUpdate(connected);
+            lastKnownConnectionState = connected;
+        }
+    }
+
+    lastUIUpdate = millis();
+}
+
+// Main Loop - UI Operations Only (Core 1)
 void loop()
 {
   esp_task_wdt_reset();  // Reset watchdog at start of every loop iteration
 
-  // Update scale connection state machine if connecting
-  if (scale.isConnecting())
-  {
-    scale.update();  // Non-blocking - returns immediately after state update
+  // DIAGNOSTIC: Log main loop heartbeat every 10 seconds to detect freezes
+  static unsigned long lastLoopLog = 0;
+  if (millis() - lastLoopLog > 10000) {
+    LOG_DEBUG(TAG_TASK, "Main loop heartbeat (Core 1 alive)");
+    lastLoopLog = millis();
   }
 
+  // ========================================================================
+  // UI OPERATIONS ONLY - All BLE operations moved to BLE task on Core 0!
+  // ========================================================================
+
+  // LVGL UI updates (CRITICAL - must run frequently)
   LVGLTimerHandlerRoutine();
 
-  // Check for display sleep timeout (5 minutes of inactivity)
-  if (!displayAsleep && (millis() - lastTouchTime) > DISPLAY_SLEEP_TIMEOUT_MS)
-  {
-    DEBUG_PRINTLN("Display sleep timeout - putting display to sleep");
-    lcd_sleep();
-    displayAsleep = true;
-  }
-  checkScaleStatus();
-  checkHeartBreat();
+  // Process queued UI updates from BLE task (professional thread-safe pattern)
+  processUIUpdates();
+
+  // Update connection status from BLE task (polls shared memory)
+  updateUIWithBLEData();
+
+  // Display sleep/wake management (UI operation)
+  // DISABLED FOR DEBUGGING - Prevents display from sleeping during development
+  // Uncomment to re-enable auto-sleep after 5 minutes of inactivity
+  // if (!displayAsleep && (millis() - lastTouchTime) > DISPLAY_SLEEP_TIMEOUT_MS)
+  // {
+  //   LOG_DEBUG(TAG_UI, "Display sleep timeout - putting display to sleep");
+  //   lcd_sleep();
+  //   displayAsleep = true;
+  // }
+
+  // Handle flushing cycle (relay control - UI related)
   handleFlushingCycle();
-  handleBLESequence();    // Non-blocking BLE command sequencer
-  updateScaleReadings();
-  updateShotTimer();      // Independent timer update every 0.1s
-  handleShotWatchdogs();
+
+  // Process status message queue (UI updates)
   processPendingStatusQueue();
+
+  // All BLE operations now run in bleTaskFunction() on Core 0:
+  //   - scale.update()
+  //   - checkScaleStatus()
+  //   - checkHeartBreat()
+  //   - handleBLESequence()
+  //   - updateScaleReadings()
+  //   - updateShotTimer()
+  //   - handleShotWatchdogs()
 }

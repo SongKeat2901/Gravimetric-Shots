@@ -10,10 +10,6 @@
 #include "Arduino.h"
 #include "AcaiaArduinoBLE.h"
 #include "NimBLEDevice.h"
-#include "../../src/debug_config.h"  // Professional logging system
-
-// Logging tag for BLE subsystem
-static const char* TAG = "BLE";
 
 #define HEADER1 0xef
 #define HEADER2 0xdd
@@ -42,23 +38,9 @@ class AcaiaScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
         if (AcaiaArduinoBLE::_instance) {
             String name = String(advertisedDevice->getName().c_str());
-
-            // DIAGNOSTIC: Log ALL BLE devices found during scan
-            // This helps verify ESP32 BLE is working and shows what devices are visible
-            if (name.length() > 0) {
-                LOG_DEBUG(TAG, "BLE device found: '%s' (RSSI: %d dBm, Address: %s)",
-                          name.c_str(),
-                          advertisedDevice->getRSSI(),
-                          advertisedDevice->getAddress().toString().c_str());
-            } else {
-                LOG_VERBOSE(TAG, "BLE device found: <no name> (RSSI: %d dBm, Address: %s)",
-                            advertisedDevice->getRSSI(),
-                            advertisedDevice->getAddress().toString().c_str());
-            }
-
-            // Check if this is a supported scale
             if (AcaiaArduinoBLE::_instance->isScaleName(name)) {
-                LOG_INFO(TAG, "✓ ACAIA SCALE FOUND: %s", name.c_str());
+                Serial.print("Scale found: ");
+                Serial.println(name);
                 NimBLEDevice::getScan()->stop();
                 // Store device for connection
                 AcaiaArduinoBLE::_instance->_pAdvDevice = advertisedDevice;
@@ -70,25 +52,12 @@ class AcaiaScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 // Client callbacks - handle connection events
 class AcaiaClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) {
-        LOG_DEBUG(TAG, "NimBLE Client connected");
+        Serial.println("NimBLE Client connected");
     }
-
+    
     void onDisconnect(NimBLEClient* pClient) {
-        // DIAGNOSTIC: Log disconnect with timing context
+        Serial.println("NimBLE Client disconnected");
         if (AcaiaArduinoBLE::_instance) {
-            unsigned long timeSinceLastPacket = AcaiaArduinoBLE::_instance->_lastPacket ?
-                (millis() - AcaiaArduinoBLE::_instance->_lastPacket) : 0;
-            unsigned long timeSinceLastHeartbeat = millis() - AcaiaArduinoBLE::_instance->_lastHeartBeat;
-
-            LOG_WARN(TAG, "=== SCALE DISCONNECTED ===");
-            LOG_WARN(TAG, "  Last packet: %lums ago", timeSinceLastPacket);
-            LOG_WARN(TAG, "  Last heartbeat: %lums ago (period=%dms)",
-                     timeSinceLastHeartbeat, HEARTBEAT_PERIOD_MS);
-            LOG_WARN(TAG, "  Timeout threshold: %dms", MAX_PACKET_PERIOD_MS);
-            LOG_WARN(TAG, "  Disconnect initiated by: %s",
-                     (timeSinceLastPacket >= MAX_PACKET_PERIOD_MS) ? "ESP32 (timeout)" : "Scale (remote)");
-            LOG_WARN(TAG, "==========================");
-
             AcaiaArduinoBLE::_instance->_connected = false;
             // CRITICAL: Transition state machine to FAILED on disconnect
             // This prevents continued execution with invalid pointers
@@ -97,8 +66,6 @@ class AcaiaClientCallbacks : public NimBLEClientCallbacks {
             AcaiaArduinoBLE::_instance->_pReadChar = nullptr;
             AcaiaArduinoBLE::_instance->_pWriteChar = nullptr;
             AcaiaArduinoBLE::_instance->_pService = nullptr;
-        } else {
-            LOG_WARN(TAG, "NimBLE Client disconnected (no instance context)");
         }
     }
 };
@@ -139,7 +106,9 @@ bool AcaiaArduinoBLE::init(String mac)
         return false;
     }
 
-    LOG_INFO(TAG, "AcaiaArduinoBLE Library v%s - Starting non-blocking connection...", LIBRARY_VERSION);
+    Serial.print("AcaiaArduinoBLE Library v");
+    Serial.print(LIBRARY_VERSION);
+    Serial.println(" - Starting non-blocking connection...");
 
     _mac = mac;
     _lastPacket = 0;
@@ -149,7 +118,7 @@ bool AcaiaArduinoBLE::init(String mac)
     // Get or create scan object
     _pScan = NimBLEDevice::getScan();
     if (!_pScan) {
-        LOG_ERROR(TAG, "Failed to get scan object!");
+        Serial.println("Failed to get scan object!");
         return false;
     }
 
@@ -160,7 +129,7 @@ bool AcaiaArduinoBLE::init(String mac)
     _pScan->setWindow(99);
 
     // Start scanning
-    LOG_INFO(TAG, "BLE scan started (non-blocking)");
+    Serial.println("BLE scan started (non-blocking)");
     _pScan->start(0, nullptr, false); // 0 = scan forever until stopped
     
     transitionTo(CONN_SCANNING, 10000);  // 10 second scan timeout
@@ -171,20 +140,20 @@ bool AcaiaArduinoBLE::tare()
 {
     if (!_connected || !_pWriteChar)
     {
-        LOG_DEBUG(TAG, "tare failed: not connected");
+        Serial.println("tare failed: not connected");
         return false;
     }
 
-    if (_pWriteChar->writeValue((_type == GENERIC ? TARE_GENERIC : TARE_ACAIA),
+    if (_pWriteChar->writeValue((_type == GENERIC ? TARE_GENERIC : TARE_ACAIA), 
                                   (_type == GENERIC ? 1 : 6), true))
     {
-        LOG_DEBUG(TAG, "tare write successful");
+        Serial.println("tare write successful");
         return true;
     }
     else
     {
         _connected = false;
-        LOG_ERROR(TAG, "tare write failed");
+        Serial.println("tare write failed");
         return false;
     }
 }
@@ -193,19 +162,19 @@ bool AcaiaArduinoBLE::startTimer()
 {
     if (!_connected || !_pWriteChar)
     {
-        LOG_DEBUG(TAG, "start timer failed: not connected");
+        Serial.println("start timer failed: not connected");
         return false;
     }
 
     if (_pWriteChar->writeValue(START_TIMER, 7, true))
     {
-        LOG_DEBUG(TAG, "start timer write successful");
+        Serial.println("start timer write successful");
         return true;
     }
     else
     {
         _connected = false;
-        LOG_ERROR(TAG, "start timer write failed");
+        Serial.println("start timer write failed");
         return false;
     }
 }
@@ -214,19 +183,19 @@ bool AcaiaArduinoBLE::stopTimer()
 {
     if (!_connected || !_pWriteChar)
     {
-        LOG_DEBUG(TAG, "stop timer failed: not connected");
+        Serial.println("stop timer failed: not connected");
         return false;
     }
 
     if (_pWriteChar->writeValue(STOP_TIMER, 7, true))
     {
-        LOG_DEBUG(TAG, "stop timer write successful");
+        Serial.println("stop timer write successful");
         return true;
     }
     else
     {
         _connected = false;
-        LOG_ERROR(TAG, "stop timer write failed");
+        Serial.println("stop timer write failed");
         return false;
     }
 }
@@ -235,19 +204,19 @@ bool AcaiaArduinoBLE::resetTimer()
 {
     if (!_connected || !_pWriteChar)
     {
-        LOG_DEBUG(TAG, "reset timer failed: not connected");
+        Serial.println("reset timer failed: not connected");
         return false;
     }
 
     if (_pWriteChar->writeValue(RESET_TIMER, 7, true))
     {
-        LOG_DEBUG(TAG, "reset timer write successful");
+        Serial.println("reset timer write successful");
         return true;
     }
     else
     {
         _connected = false;
-        LOG_ERROR(TAG, "reset timer write failed");
+        Serial.println("reset timer write failed");
         return false;
     }
 }
@@ -256,24 +225,17 @@ bool AcaiaArduinoBLE::heartbeat()
 {
     if (!_connected || !_pWriteChar)
     {
-        LOG_VERBOSE(TAG, "heartbeat failed: not connected");
+        Serial.println("heartbeat failed: not connected");
         return false;
     }
-
-    // DIAGNOSTIC: Log heartbeat with timing info
-    unsigned long timeSinceLastPacket = _lastPacket ? (millis() - _lastPacket) : 0;
-    LOG_INFO(TAG, "Sending heartbeat (last packet %lums ago, timeout=%dms)",
-             timeSinceLastPacket, MAX_PACKET_PERIOD_MS);
 
     if (_pWriteChar->writeValue(HEARTBEAT, 7, true))
     {
         _lastHeartBeat = millis();
-        LOG_DEBUG(TAG, "Heartbeat sent successfully");
         return true;
     }
     else
     {
-        LOG_ERROR(TAG, "Heartbeat write FAILED - disconnecting");
         _connected = false;
         return false;
     }
@@ -317,23 +279,12 @@ void AcaiaArduinoBLE::notifyCallback(NimBLERemoteCharacteristic* pRemoteCharacte
 
 void AcaiaArduinoBLE::handleNotification(uint8_t* pData, size_t length)
 {
-    // DIAGNOSTIC: Log ALL incoming notifications to debug why weight data isn't updating
-    LOG_DEBUG(TAG, "Notification received: %d bytes, type=%d", length, _type);
-
-    // Log first few bytes for debugging
-    if (length >= 5) {
-        LOG_VERBOSE(TAG, "  Data: [0]=0x%02X [1]=0x%02X [2]=0x%02X [3]=0x%02X [4]=0x%02X",
-                    pData[0], pData[1], pData[2], pData[3], pData[4]);
-    }
-
     // Parse weight data based on scale type
     if (NEW == _type && length >= 13 && pData[2] == 0x0C && pData[4] == 0x05)
     {
         // New Acaia (Lunar 2021, Pyxis)
         _currentWeight = (((pData[6] & 0xff) << 8) + (pData[5] & 0xff)) / pow(10, pData[9]) * ((pData[10] & 0x02) ? -1 : 1);
-
-        LOG_DEBUG(TAG, "Weight parsed: %.2fg", _currentWeight);
-
+        
         if (_lastPacket)
         {
             _packetPeriod = millis() - _lastPacket;
@@ -344,9 +295,7 @@ void AcaiaArduinoBLE::handleNotification(uint8_t* pData, size_t length)
     {
         // Old Acaia (Lunar pre-2021)
         _currentWeight = (((pData[3] & 0xff) << 8) + (pData[2] & 0xff)) / pow(10, pData[6]) * ((pData[7] & 0x02) ? -1 : 1);
-
-        LOG_DEBUG(TAG, "Weight parsed: %.2fg", _currentWeight);
-
+        
         if (_lastPacket)
         {
             _packetPeriod = millis() - _lastPacket;
@@ -356,47 +305,25 @@ void AcaiaArduinoBLE::handleNotification(uint8_t* pData, size_t length)
     else if (GENERIC == _type && length >= 13)
     {
         // Generic scales (Felicita Arc)
-        _currentWeight = (pData[2] == 0x2B ? 1 : -1) *
-                        ((pData[3] - 0x30) * 1000 + (pData[4] - 0x30) * 100 +
-                         (pData[5] - 0x30) * 10 + (pData[6] - 0x30) * 1 +
+        _currentWeight = (pData[2] == 0x2B ? 1 : -1) * 
+                        ((pData[3] - 0x30) * 1000 + (pData[4] - 0x30) * 100 + 
+                         (pData[5] - 0x30) * 10 + (pData[6] - 0x30) * 1 + 
                          (pData[7] - 0x30) * 0.1 + (pData[8] - 0x30) * 0.01);
-
-        LOG_DEBUG(TAG, "Weight parsed: %.2fg", _currentWeight);
-
+        
         if (_lastPacket)
         {
             _packetPeriod = millis() - _lastPacket;
         }
         _lastPacket = millis();
     }
-    else
-    {
-        // DIAGNOSTIC: Notification didn't match any known format
-        LOG_WARN(TAG, "Unrecognized notification format (type=%d, len=%d, [2]=0x%02X, [4]=0x%02X)",
-                 _type, length,
-                 length > 2 ? pData[2] : 0x00,
-                 length > 4 ? pData[4] : 0x00);
-    }
 }
 
 bool AcaiaArduinoBLE::newWeightAvailable()
 {
-    // DIAGNOSTIC: Log packet timing every 5 seconds
-    static unsigned long lastDiagnostic = 0;
-    if (_connected && _lastPacket && (millis() - lastDiagnostic > 5000))
-    {
-        unsigned long timeSincePacket = millis() - _lastPacket;
-        LOG_VERBOSE(TAG, "Packet health check: last packet %lums ago (timeout at %dms)",
-                    timeSincePacket, MAX_PACKET_PERIOD_MS);
-        lastDiagnostic = millis();
-    }
-
     // Check for connection timeout
     if (_lastPacket && millis() - _lastPacket > MAX_PACKET_PERIOD_MS)
     {
-        LOG_ERROR(TAG, "Connection timeout - no packets received!");
-        LOG_ERROR(TAG, "  Last packet was %lums ago (threshold: %dms)",
-                  millis() - _lastPacket, MAX_PACKET_PERIOD_MS);
+        Serial.println("Connection timeout - no packets received!");
         _connected = false;
         _connState = CONN_FAILED;
         _lastPacket = 0;
@@ -465,13 +392,13 @@ void AcaiaArduinoBLE::stateScanning()
 
 void AcaiaArduinoBLE::stateConnecting()
 {
-    LOG_INFO(TAG, "Connecting ...");
-
+    Serial.println("Connecting ...");
+    
     // Create or get client
     if (!_pClient) {
         _pClient = NimBLEDevice::createClient();
         if (!_pClient) {
-            LOG_ERROR(TAG, "Failed to create client!");
+            Serial.println("Failed to create client!");
             transitionTo(CONN_FAILED, 0);
             return;
         }
@@ -479,16 +406,16 @@ void AcaiaArduinoBLE::stateConnecting()
         _pClient->setConnectionParams(12, 12, 0, 150);
         _pClient->setConnectTimeout(5);
     }
-
+    
     // Connect to device
     if (_pClient->connect(_pAdvDevice))
     {
-        LOG_INFO(TAG, "Connected");
+        Serial.println("Connected");
         transitionTo(CONN_DISCOVERING, 5000);  // 5s discover timeout
     }
     else
     {
-        LOG_ERROR(TAG, "Connection failed!");
+        Serial.println("Connection failed!");
         _pAdvDevice = nullptr;
         transitionTo(CONN_FAILED, 0);
     }
@@ -496,14 +423,14 @@ void AcaiaArduinoBLE::stateConnecting()
 
 void AcaiaArduinoBLE::stateDiscovering()
 {
-    LOG_DEBUG(TAG, "Discovering services ...");
-
+    Serial.println("Discovering services ...");
+    
     // Reset watchdog (can take time)
     esp_task_wdt_reset();
-
+    
     // Try to get services (NimBLE auto-discovers on connect)
     // Just need to find the right characteristic UUIDs
-
+    
     transitionTo(CONN_SUBSCRIBING, 5000);  // 5s subscribe timeout
 }
 
@@ -512,12 +439,12 @@ void AcaiaArduinoBLE::stateSubscribing()
     // Reset watchdog before characteristic operations
     esp_task_wdt_reset();
 
-    LOG_DEBUG(TAG, "Finding characteristics ...");
+    Serial.println("Finding characteristics ...");
 
     // CRITICAL: Check if still connected before accessing characteristics
     // Client can disconnect during previous state transitions
     if (!_pClient || !_pClient->isConnected()) {
-        LOG_ERROR(TAG, "Client disconnected during subscribing");
+        Serial.println("Client disconnected during subscribing");
         transitionTo(CONN_FAILED, 0);
         return;
     }
@@ -530,7 +457,7 @@ void AcaiaArduinoBLE::stateSubscribing()
 
         // Check connection after getCharacteristics (can trigger disconnect)
         if (!_pClient->isConnected()) {
-            LOG_ERROR(TAG, "Client disconnected during OLD characteristic discovery");
+            Serial.println("Client disconnected during OLD characteristic discovery");
             transitionTo(CONN_FAILED, 0);
             return;
         }
@@ -539,13 +466,13 @@ void AcaiaArduinoBLE::stateSubscribing()
 
         // CRITICAL: Check connection again before committing pointers
         if (!_pClient->isConnected()) {
-            LOG_ERROR(TAG, "Client disconnected after getting OLD read characteristic");
+            Serial.println("Client disconnected after getting OLD read characteristic");
             transitionTo(CONN_FAILED, 0);
             return;
         }
 
         if (tempReadChar && tempReadChar->canNotify()) {
-            LOG_INFO(TAG, "Old version Acaia Detected");
+            Serial.println("Old version Acaia Detected");
             _type = OLD;
             _pReadChar = tempReadChar;
             _pWriteChar = _pService->getCharacteristic(NimBLEUUID(WRITE_CHAR_OLD_VERSION));
@@ -561,7 +488,7 @@ void AcaiaArduinoBLE::stateSubscribing()
 
             // Check connection after getCharacteristics (can trigger disconnect)
             if (!_pClient->isConnected()) {
-                LOG_ERROR(TAG, "Client disconnected during NEW characteristic discovery");
+                Serial.println("Client disconnected during NEW characteristic discovery");
                 transitionTo(CONN_FAILED, 0);
                 return;
             }
@@ -571,13 +498,13 @@ void AcaiaArduinoBLE::stateSubscribing()
             // CRITICAL: Check connection again before committing pointers
             // Disconnect can happen between getCharacteristics and getCharacteristic
             if (!_pClient->isConnected()) {
-                LOG_ERROR(TAG, "Client disconnected after getting read characteristic");
+                Serial.println("Client disconnected after getting read characteristic");
                 transitionTo(CONN_FAILED, 0);
                 return;
             }
 
             if (tempReadChar && tempReadChar->canNotify()) {
-                LOG_INFO(TAG, "New version Acaia Detected");
+                Serial.println("New version Acaia Detected");
                 _type = NEW;
                 _pReadChar = tempReadChar;
                 _pWriteChar = _pService->getCharacteristic(NimBLEUUID(WRITE_CHAR_NEW_VERSION));
@@ -594,7 +521,7 @@ void AcaiaArduinoBLE::stateSubscribing()
 
             // Check connection after getCharacteristics (can trigger disconnect)
             if (!_pClient->isConnected()) {
-                LOG_ERROR(TAG, "Client disconnected during GENERIC characteristic discovery");
+                Serial.println("Client disconnected during GENERIC characteristic discovery");
                 transitionTo(CONN_FAILED, 0);
                 return;
             }
@@ -603,13 +530,13 @@ void AcaiaArduinoBLE::stateSubscribing()
 
             // CRITICAL: Check connection again before committing pointers
             if (!_pClient->isConnected()) {
-                LOG_ERROR(TAG, "Client disconnected after getting GENERIC read characteristic");
+                Serial.println("Client disconnected after getting GENERIC read characteristic");
                 transitionTo(CONN_FAILED, 0);
                 return;
             }
 
             if (tempReadChar && tempReadChar->canNotify()) {
-                LOG_INFO(TAG, "Generic Scale Detected");
+                Serial.println("Generic Scale Detected");
                 _type = GENERIC;
                 _pReadChar = tempReadChar;
                 _pWriteChar = _pService->getCharacteristic(NimBLEUUID(WRITE_CHAR_GENERIC));
@@ -618,7 +545,7 @@ void AcaiaArduinoBLE::stateSubscribing()
     }
 
     if (!_pReadChar || !_pWriteChar) {
-        LOG_ERROR(TAG, "Unable to determine scale type or find characteristics");
+        Serial.println("Unable to determine scale type or find characteristics");
         _pClient->disconnect();
         transitionTo(CONN_FAILED, 0);
         return;
@@ -627,54 +554,54 @@ void AcaiaArduinoBLE::stateSubscribing()
     // CRITICAL: Verify still connected before subscribing
     // Client can disconnect during characteristic discovery
     if (!_pClient->isConnected()) {
-        LOG_ERROR(TAG, "Client disconnected before subscription");
+        Serial.println("Client disconnected before subscription");
         transitionTo(CONN_FAILED, 0);
         return;
     }
 
     // Subscribe to notifications
     if (!_pReadChar->subscribe(true, notifyCallback)) {
-        LOG_ERROR(TAG, "Subscription failed");
+        Serial.println("Subscription failed");
         transitionTo(CONN_FAILED, 0);
         return;
     }
-
-    LOG_INFO(TAG, "Subscribed to notifications");
+    
+    Serial.println("Subscribed to notifications");
     transitionTo(CONN_IDENTIFYING, 5000);  // 5s identify timeout
 }
 
 void AcaiaArduinoBLE::stateIdentifying()
 {
-    LOG_DEBUG(TAG, "Sending identify ...");
-
+    Serial.println("Sending identify ...");
+    
     if (!_pWriteChar->writeValue(IDENTIFY, 20, true)) {
-        LOG_ERROR(TAG, "Identify write failed");
+        Serial.println("Identify write failed");
         transitionTo(CONN_FAILED, 0);
         return;
     }
-
-    LOG_DEBUG(TAG, "Identify sent");
+    
+    Serial.println("Identify sent");
     transitionTo(CONN_BATTERY, 2000);  // 2s battery timeout
 }
 
 void AcaiaArduinoBLE::stateBattery()
 {
-    LOG_DEBUG(TAG, "Requesting battery (skipping for now) ...");
+    Serial.println("Requesting battery (skipping for now) ...");
     // Battery request implementation can be added later
     transitionTo(CONN_NOTIFICATIONS, 2000);
 }
 
 void AcaiaArduinoBLE::stateNotifications()
 {
-    LOG_DEBUG(TAG, "Enabling weight notifications ...");
-
+    Serial.println("Enabling weight notifications ...");
+    
     if (!_pWriteChar->writeValue(NOTIFICATION_REQUEST, 14, true)) {
-        LOG_ERROR(TAG, "Notification request write failed");
+        Serial.println("Notification request write failed");
         transitionTo(CONN_FAILED, 0);
         return;
     }
-
-    LOG_INFO(TAG, "Weight notifications enabled");
+    
+    Serial.println("Weight notifications enabled");
     _connected = true;
     _lastHeartBeat = millis();
     _lastPacket = 0;  // Reset packet timer
@@ -702,7 +629,8 @@ bool AcaiaArduinoBLE::update()
     {
         if (millis() - _connStateStart > _connTimeout)
         {
-            LOG_WARN(TAG, "State timeout: %s", getStateString());
+            Serial.print("State timeout: ");
+            Serial.println(getStateString());
 
             if (_pScan && _pScan->isScanning()) {
                 _pScan->stop();
@@ -753,7 +681,7 @@ bool AcaiaArduinoBLE::update()
             return true;
 
         case CONN_FAILED:
-            LOG_INFO(TAG, "Connection failed - cleaning up and restarting scan");
+            Serial.println("Connection failed - cleaning up and restarting scan");
 
             // Stop any ongoing scan
             if (_pScan && _pScan->isScanning()) {
@@ -763,7 +691,7 @@ bool AcaiaArduinoBLE::update()
             // Disconnect client
             if (_pClient) {
                 if (_pClient->isConnected()) {
-                    LOG_DEBUG(TAG, "Disconnecting client");
+                    Serial.println("Disconnecting client");
                     _pClient->disconnect();
                 }
                 NimBLEDevice::deleteClient(_pClient);
@@ -784,13 +712,13 @@ bool AcaiaArduinoBLE::update()
             delay(100);
 
             // Restart scan
-            LOG_INFO(TAG, "Scan restarted (non-blocking reconnect)");
+            Serial.println("Scan restarted (non-blocking reconnect)");
             _pScan = NimBLEDevice::getScan();
             if (_pScan) {
                 _pScan->start(0, nullptr, false);
                 transitionTo(CONN_SCANNING, 10000);  // 10s scan timeout
             } else {
-                LOG_ERROR(TAG, "Failed to restart scan");
+                Serial.println("Failed to restart scan");
                 transitionTo(CONN_IDLE, 0);
             }
             break;

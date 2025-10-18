@@ -7,9 +7,6 @@
 #define TFT_SPI_MODE          SPI_MODE0
 #define TFT_SPI_HOST          SPI2_HOST
 
-#define WIFI_SSID             "xinyuandianzi"
-#define WIFI_PASSWORD         "AA15994823428"
-
 #define WIFI_CONNECT_WAIT_MAX (30 * 1000)
 
 #define NTP_SERVER1           "pool.ntp.org"

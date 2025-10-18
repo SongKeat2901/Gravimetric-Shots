@@ -14,6 +14,12 @@
 // Web server for WebSerial (port 80)
 AsyncWebServer debugServer(80);
 
+// WebSerial ready flag (false until WebSerial.begin() is called)
+bool webSerialReady = false;
+
+// Logging tag for WiFi subsystem
+static const char* TAG = "WiFi";
+
 // =============================================================================
 // WebSerial Message Callback
 // =============================================================================
@@ -70,87 +76,99 @@ void webSerialCallback(uint8_t *data, size_t len) {
 //   - Continues without WiFi if connection fails (graceful degradation)
 // =============================================================================
 void setupWirelessDebug() {
-  Serial.begin(115200);
-  delay(100);  // Brief delay for Serial to stabilize
+  // DON'T call Serial.begin() here - already initialized in main setup()!
+  // Calling Serial.begin() again after NimBLE init corrupts USB CDC on ESP32-S3
+  // Serial.begin(115200);  ← REMOVED - causes "Device not configured" error
+  // delay(100);
 
-  Serial.println("\n");
-  Serial.println("=============================================================================");
-  Serial.println("  Gravimetric Shots - WIRELESS DEBUG MODE");
-  Serial.println("=============================================================================");
-  Serial.println();
+  // WiFi setup banner (using LOG_INFO for important startup messages)
+  LOG_INFO(TAG, "");
+  LOG_INFO(TAG, "=============================================================================");
+  LOG_INFO(TAG, "  Gravimetric Shots - WIRELESS DEBUG MODE");
+  LOG_INFO(TAG, "=============================================================================");
+  LOG_INFO(TAG, "");
 
   // Enable BLE/WiFi coexistence BEFORE initializing WiFi
   // This is critical on ESP32-S3 where BLE and WiFi share the same radio
-  esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);  // Balanced priority for BLE and WiFi
+  LOG_DEBUG(TAG, "Enabling BLE/WiFi coexistence (balanced mode)");
+  esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
 
   // Connect to WiFi
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  Serial.print("[WiFi] Connecting to: ");
-  Serial.println(WIFI_SSID);
-  Serial.print("[WiFi] Status: ");
+  // WiFi connection attempt
+  LOG_INFO(TAG, "Connecting to: %s", WIFI_SSID);
+  LOG_DEBUG(TAG, "Status: connecting...");
+
+  // Print dots without newline (special case - keep mutex-protected)
+  if (serialMutex && xSemaphoreTake(serialMutex, pdMS_TO_TICKS(2000))) {
+    Serial.print("         ");  // Indent for visual alignment
+    xSemaphoreGive(serialMutex);
+  }
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
-    Serial.print(".");
+    if (serialMutex && xSemaphoreTake(serialMutex, pdMS_TO_TICKS(2000))) {
+      Serial.print(".");
+      xSemaphoreGive(serialMutex);
+    }
     attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" Connected!");
-    Serial.println();
-    Serial.println("[WiFi] Connection successful:");
-    Serial.print("  IP Address:  ");
-    Serial.println(WiFi.localIP());
-    Serial.print("  MAC Address: ");
-    Serial.println(WiFi.macAddress());
-    Serial.print("  RSSI:        ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-    Serial.println();
-    Serial.println("[WebSerial] Access URL:");
-    Serial.print("  http://");
-    Serial.print(WiFi.localIP());
-    Serial.println("/webserial");
-    Serial.println();
+    // WiFi connection successful
+    LOG_INFO(TAG, "Connected!");
+    LOG_INFO(TAG, "");
+    LOG_INFO(TAG, "Connection successful:");
+    LOG_INFO(TAG, "  IP Address:  %s", WiFi.localIP().toString().c_str());
+    LOG_DEBUG(TAG, "  MAC Address: %s", WiFi.macAddress().c_str());
+    LOG_DEBUG(TAG, "  RSSI:        %d dBm", WiFi.RSSI());
+    LOG_INFO(TAG, "");
+    LOG_INFO(TAG, "WebSerial Access URL:");
+    LOG_INFO(TAG, "  http://%s/webserial", WiFi.localIP().toString().c_str());
+    LOG_INFO(TAG, "");
 
-    // Optimize WiFi for BLE coexistence
-    // - Disable sleep for lower latency (BLE heartbeat timing is critical)
-    // - Trade: Higher power consumption for better responsiveness
-    WiFi.setSleep(false);
-    Serial.println("[WiFi] Low-latency mode enabled (sleep disabled)");
+    // CRITICAL: Enable WiFi modem sleep for BLE coexistence
+    // ESP32-S3 REQUIRES modem sleep when both WiFi and BLE are active
+    // This allows time-division multiplexing of the shared radio
+    WiFi.setSleep(WIFI_PS_MIN_MODEM);
+    LOG_DEBUG(TAG, "Modem sleep enabled (required for BLE coexistence)");
 
     // Initialize WebSerial
     WebSerial.begin(&debugServer);
     WebSerial.onMessage(webSerialCallback);
 
+    // Mark WebSerial as ready for logging
+    webSerialReady = true;
+
     // Start HTTP server
     debugServer.begin();
 
-    Serial.println("[WebSerial] Server started on port 80");
-    Serial.println();
-    Serial.println("=============================================================================");
-    Serial.println("  Ready for wireless monitoring!");
-    Serial.println("  Open the URL above in any browser (phone, tablet, laptop)");
-    Serial.println("=============================================================================");
-    Serial.println();
+    // Final banner
+    LOG_INFO(TAG, "WebSerial server started on port 80");
+    LOG_INFO(TAG, "");
+    LOG_INFO(TAG, "=============================================================================");
+    LOG_INFO(TAG, "  Ready for wireless monitoring!");
+    LOG_INFO(TAG, "  Open the URL above in any browser (phone, tablet, laptop)");
+    LOG_INFO(TAG, "=============================================================================");
+    LOG_INFO(TAG, "");
   }
   else {
-    Serial.println(" FAILED");
-    Serial.println();
-    Serial.println("[WiFi] Connection failed after 10 seconds");
-    Serial.println("[WiFi] Continuing without wireless debug");
-    Serial.println("[WiFi] Check credentials in wifi_credentials.h:");
-    Serial.print("  SSID: ");
-    Serial.println(WIFI_SSID);
-    Serial.println("  PASS: ********");
-    Serial.println();
-    Serial.println("=============================================================================");
-    Serial.println("  USB Serial monitoring only (WiFi unavailable)");
-    Serial.println("=============================================================================");
-    Serial.println();
+    // WiFi connection failed
+    LOG_ERROR(TAG, "FAILED");
+    LOG_ERROR(TAG, "");
+    LOG_ERROR(TAG, "Connection failed after 10 seconds");
+    LOG_WARN(TAG, "Continuing without wireless debug");
+    LOG_INFO(TAG, "Check credentials in wifi_credentials.h:");
+    LOG_INFO(TAG, "  SSID: %s", WIFI_SSID);
+    LOG_INFO(TAG, "  PASS: ********");
+    LOG_INFO(TAG, "");
+    LOG_INFO(TAG, "=============================================================================");
+    LOG_INFO(TAG, "  USB Serial monitoring only (WiFi unavailable)");
+    LOG_INFO(TAG, "=============================================================================");
+    LOG_INFO(TAG, "");
   }
 }
 
