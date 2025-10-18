@@ -846,36 +846,23 @@ bool sendBLECommand(BLECommand cmd, uint32_t param = 0) {
 // Display & Touch Callbacks
 // -----------------------------------------------------------------------------
 
-// Display flush callback monitoring - detects when graphics rendering stops
-static unsigned long lastFlushCall = 0;
+// Display flush callback monitoring - tracks flush frequency for diagnostics
+// NOTE: Flush only happens when UI changes (not continuous during idle - this is normal!)
+// Real freeze detection is done via lv_timer_handler() monitoring (see LVGLTimerHandlerRoutine)
 static unsigned long flushCallCount = 0;
-static bool flushStoppedWarned = false;
 
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
 {
   unsigned long now = millis();
 
-  // Detect if flush callback hasn't been called (graphics stopped rendering)
-  if (lastFlushCall > 0 && (now - lastFlushCall) > 5000) {
-    if (!flushStoppedWarned) {
-      LOG_ERROR(TAG_UI, "🖼️  GRAPHICS RENDERING STOPPED!");
-      LOG_ERROR(TAG_UI, "   Last flush: %lums ago (display content frozen)", now - lastFlushCall);
-      LOG_ERROR(TAG_UI, "   Total flushes: %lu", flushCallCount);
-      flushStoppedWarned = true;
-    }
-  } else if (flushStoppedWarned && (now - lastFlushCall) <= 5000) {
-    LOG_ERROR(TAG_UI, "✅ GRAPHICS RENDERING RESUMED");
-    flushStoppedWarned = false;
-  }
-
-  lastFlushCall = now;
   flushCallCount++;
 
-  // Log flush activity every 10 seconds (reduced to catch issues before 35s crash)
+  // Log flush activity every 10 seconds for diagnostic purposes
+  // NOTE: Flush rate varies with UI activity (0 Hz when idle is normal)
   static unsigned long lastFlushLog = 0;
   if (now - lastFlushLog > 10000) {
-    LOG_WARN(TAG_UI, "🖼️  Display Flush: %lu calls in last 10s (~%lu Hz)",
-             flushCallCount, flushCallCount / 10);
+    LOG_DEBUG(TAG_UI, "🖼️  Display Flush: %lu calls in last 10s (~%lu Hz)",
+              flushCallCount, flushCallCount / 10);
     flushCallCount = 0;
     lastFlushLog = now;
   }
@@ -1675,11 +1662,12 @@ void LVGLTimerHandlerRoutine()
     lastLVGLTimerCall = now;
     lvglTimerCallCount++;
 
-    // Log LVGL activity every 10 seconds (reduced to catch issues before 35s crash)
+    // Log LVGL activity every 10 seconds for diagnostic purposes
+    // NOTE: This should always run at ~500-700 Hz - if it drops, there's a real freeze
     static unsigned long lastActivityLog = 0;
     if (now - lastActivityLog > 10000) {
-      LOG_WARN(TAG_UI, "📊 LVGL Activity: %lu timer calls in last 10s (~%lu Hz)",
-               lvglTimerCallCount, lvglTimerCallCount / 10);
+      LOG_DEBUG(TAG_UI, "📊 LVGL Activity: %lu timer calls in last 10s (~%lu Hz)",
+                lvglTimerCallCount, lvglTimerCallCount / 10);
       lvglTimerCallCount = 0;
       lastActivityLog = now;
     }
