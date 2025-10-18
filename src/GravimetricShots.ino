@@ -2271,8 +2271,8 @@ void loop()
   // Update connection status from BLE task (polls shared memory)
   updateUIWithBLEData();
 
-  // Display sleep/wake management (UI operation)
-  // TEMPORARILY DISABLED - Testing if sleep is causing reboots
+  // Display sleep/wake management (UI operation) - Disabled for production
+  // Sleep mode can be re-enabled by uncommenting the block below
   // if (!displayAsleep && (millis() - lastTouchTime) > DISPLAY_SLEEP_TIMEOUT_MS)
   // {
   //   LOG_INFO(TAG_UI, "Display sleep timeout (5 min idle) - putting display to sleep");
