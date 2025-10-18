@@ -153,7 +153,8 @@ class AcaiaArduinoBLE{
         NimBLERemoteService*           _pService;
         NimBLERemoteCharacteristic*    _pWriteChar;
         NimBLERemoteCharacteristic*    _pReadChar;
-        NimBLEAdvertisedDevice*        _pAdvDevice;
+        NimBLEAddress                  _deviceAddress;  // Stores BLE address (value copy, not pointer)
+        bool                           _deviceFound;    // Flag indicating scale was found during scan
         NimBLEScan*                    _pScan;
 
         // Static instance pointer for callbacks

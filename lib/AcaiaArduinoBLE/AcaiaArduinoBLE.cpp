@@ -61,8 +61,10 @@ class AcaiaScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
             if (AcaiaArduinoBLE::_instance->isScaleName(name)) {
                 LOG_INFO(TAG, "✓ ACAIA SCALE FOUND: %s", name.c_str());
                 NimBLEDevice::getScan()->stop();
-                // Store device for connection
-                AcaiaArduinoBLE::_instance->_pAdvDevice = advertisedDevice;
+                // Store device ADDRESS (value copy), not pointer
+                // FIX: Storing pointer to advertisedDevice causes crash - it's a temporary object!
+                AcaiaArduinoBLE::_instance->_deviceAddress = advertisedDevice->getAddress();
+                AcaiaArduinoBLE::_instance->_deviceFound = true;
             }
         }
     }
@@ -128,7 +130,7 @@ AcaiaArduinoBLE::AcaiaArduinoBLE()
     _pService = nullptr;
     _pWriteChar = nullptr;
     _pReadChar = nullptr;
-    _pAdvDevice = nullptr;
+    _deviceFound = false;  // Initialize device found flag
     _pScan = nullptr;
 }
 
@@ -146,7 +148,7 @@ bool AcaiaArduinoBLE::init(String mac)
     _mac = mac;
     _lastPacket = 0;
     _connected = false;
-    _pAdvDevice = nullptr;
+    _deviceFound = false;  // Reset device found flag
 
     // Get or create scan object
     _pScan = NimBLEDevice::getScan();
@@ -464,7 +466,7 @@ const char* AcaiaArduinoBLE::getStateString()
 void AcaiaArduinoBLE::stateScanning()
 {
     // Check if scan callback found a device
-    if (_pAdvDevice)
+    if (_deviceFound)
     {
         _pScan->stop();
         transitionTo(CONN_CONNECTING, 5000);  // 5s connect timeout
@@ -489,8 +491,8 @@ void AcaiaArduinoBLE::stateConnecting()
         _pClient->setConnectTimeout(5);
     }
 
-    // Connect to device
-    if (_pClient->connect(_pAdvDevice))
+    // Connect to device using stored address
+    if (_pClient->connect(_deviceAddress))
     {
         LOG_INFO(TAG, "Connected");
         transitionTo(CONN_DISCOVERING, 5000);  // 5s discover timeout
@@ -498,7 +500,7 @@ void AcaiaArduinoBLE::stateConnecting()
     else
     {
         LOG_ERROR(TAG, "Connection failed!");
-        _pAdvDevice = nullptr;
+        _deviceFound = false;  // Reset flag
         transitionTo(CONN_FAILED, 0);
     }
 }
@@ -845,7 +847,7 @@ bool AcaiaArduinoBLE::update()
             _pService = nullptr;
             _pWriteChar = nullptr;
             _pReadChar = nullptr;
-            _pAdvDevice = nullptr;
+            _deviceFound = false;  // Reset device found flag
             _connected = false;
             _lastPacket = 0;
             _packetPeriod = 0;
