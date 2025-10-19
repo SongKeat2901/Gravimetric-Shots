@@ -167,14 +167,15 @@ bool AcaiaArduinoBLE::init(String mac)
             _packetPeriod = 0;
             return true;
         }
-        unsigned long currentMillis = millis();
-        // Check if it's time to update LVGL
-        if (currentMillis - lastLvUpdate >= lvUpdateInterval)
-        {
-            // Save the last update time
-            lastLvUpdate = currentMillis;
-            LVGLTimerHandlerRoutine();
-        }
+        // CRITICAL FIX: LVGL calls REMOVED for dual-core ESP32-S3
+        // On single-core systems, LVGLTimerHandlerRoutine() kept UI responsive during 10s scan
+        // On dual-core ESP32-S3: Core 0 (BLE) + Core 1 (UI) both calling LVGL → race condition → crashes
+        // Core 1 handles all LVGL operations - Core 0 BLE task must NOT touch LVGL
+        // Watchdog is fed in bleTaskFunction() every 10ms - no timeout risk
+
+        // Feed watchdog to prevent interrupt watchdog timeout during 10s scan
+        // BLE scan takes 10s but interrupt watchdog timeout is 3s
+        esp_task_wdt_reset();
 
     } while (millis() - start < 10000);  // 10s timeout (matches upstream - tested for reconnection)
 
@@ -184,6 +185,14 @@ bool AcaiaArduinoBLE::init(String mac)
 
 bool AcaiaArduinoBLE::tare()
 {
+    // CRITICAL: Check if characteristic is still valid
+    if (!_write)
+    {
+        LOG_ERROR("BLE", "❌ Tare failed: write characteristic is NULL");
+        _connected = false;
+        return false;
+    }
+
     if (_write.writeValue((_type == GENERIC ? TARE_GENERIC : TARE_ACAIA), 20))
     {
         LOG_INFO("BLE", "⚖️  Tare command sent");
@@ -199,6 +208,14 @@ bool AcaiaArduinoBLE::tare()
 
 bool AcaiaArduinoBLE::startTimer()
 {
+    // CRITICAL: Check if characteristic is still valid
+    if (!_write)
+    {
+        LOG_ERROR("BLE", "❌ Start timer failed: write characteristic is NULL");
+        _connected = false;
+        return false;
+    }
+
     if (_write.writeValue(START_TIMER, 7))
     {
         LOG_DEBUG("BLE", "▶️  Start timer command sent");
@@ -214,6 +231,14 @@ bool AcaiaArduinoBLE::startTimer()
 
 bool AcaiaArduinoBLE::stopTimer()
 {
+    // CRITICAL: Check if characteristic is still valid
+    if (!_write)
+    {
+        LOG_ERROR("BLE", "❌ Stop timer failed: write characteristic is NULL");
+        _connected = false;
+        return false;
+    }
+
     if (_write.writeValue(STOP_TIMER, 7))
     {
         LOG_DEBUG("BLE", "⏸️  Stop timer command sent");
@@ -229,6 +254,14 @@ bool AcaiaArduinoBLE::stopTimer()
 
 bool AcaiaArduinoBLE::resetTimer()
 {
+    // CRITICAL: Check if characteristic is still valid
+    if (!_write)
+    {
+        LOG_ERROR("BLE", "❌ Reset timer failed: write characteristic is NULL");
+        _connected = false;
+        return false;
+    }
+
     if (_write.writeValue(RESET_TIMER, 7))
     {
         LOG_DEBUG("BLE", "🔄 Reset timer command sent");
@@ -244,6 +277,16 @@ bool AcaiaArduinoBLE::resetTimer()
 
 bool AcaiaArduinoBLE::heartbeat()
 {
+    // CRITICAL: Check if characteristic is still valid
+    // After long runtime or reconnection, _write can become NULL
+    // Accessing NULL characteristic causes LoadProhibited crash
+    if (!_write)
+    {
+        LOG_ERROR("BLE", "❌ Heartbeat failed: write characteristic is NULL");
+        _connected = false;
+        return false;
+    }
+
     if (_write.writeValue(HEARTBEAT, 7))
     {
         _lastHeartBeat = millis();
@@ -275,7 +318,24 @@ bool AcaiaArduinoBLE::heartbeatRequired()
 
 bool AcaiaArduinoBLE::isConnected()
 {
-    return _connected;
+    // First check our connection flag
+    if (!_connected)
+    {
+        return false;
+    }
+
+    // CRITICAL: Verify characteristics are still valid
+    // After long runtime or disconnection, ArduinoBLE can invalidate
+    // characteristic handles, leading to NULL pointer crashes
+    if (!_write || !_read)
+    {
+        LOG_WARN("BLE", "⚠️  Characteristics became invalid (write=%p, read=%p)",
+                 (void*)&_write, (void*)&_read);
+        _connected = false;
+        return false;
+    }
+
+    return true;
 }
 
 bool AcaiaArduinoBLE::newWeightAvailable()

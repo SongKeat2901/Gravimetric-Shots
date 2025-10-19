@@ -131,6 +131,13 @@ const unsigned long WDT_LOG_INTERVAL_MS = 5000;  // Log watchdog stats every 5 s
 // LVGL initialization tracking (prevent crashes from calling lv_timer_handler before init)
 static bool lvglInitialized = false;
 
+// Persistent string buffers for LVGL labels (prevent realloc bugs in LVGL v8.3.0-dev)
+// These buffers persist for the lifetime of the program, allowing lv_label_set_text_static()
+// to reference them safely without triggering LVGL's buggy dynamic realloc system
+static char weightDisplayBuffer[48] = "  0.0";
+static char timerDisplayBuffer[48] = "  0.0";
+static char statusDisplayBuffer[64] = "";
+
 // Thermal noise detection for touch controller
 static uint32_t edgeTouchCount = 0;
 static uint32_t lastEdgeTouchTime = 0;
@@ -387,24 +394,41 @@ static void processUIUpdates() {
         switch (msg.type) {
             case UI_UPDATE_WEIGHT:
                 if (ui_ScaleLabel) {
-                    lv_label_set_text(ui_ScaleLabel, msg.text);
+                    // CRITICAL FIX: Use lv_label_set_text_static() to prevent LVGL realloc bug
+                    // Copy to persistent buffer first, then reference that buffer (never goes out of scope)
+                    strncpy(weightDisplayBuffer, msg.text, sizeof(weightDisplayBuffer) - 1);
+                    weightDisplayBuffer[sizeof(weightDisplayBuffer) - 1] = '\0';
+                    lv_label_set_text_static(ui_ScaleLabel, weightDisplayBuffer);
+                } else {
+                    LOG_WARN(TAG_UI, "ui_ScaleLabel is NULL, cannot update weight");
                 }
                 break;
 
             case UI_UPDATE_TIMER:
                 if (ui_TimerLabel) {
-                    lv_label_set_text(ui_TimerLabel, msg.text);
+                    // CRITICAL FIX: Use lv_label_set_text_static() to prevent LVGL realloc bug
+                    strncpy(timerDisplayBuffer, msg.text, sizeof(timerDisplayBuffer) - 1);
+                    timerDisplayBuffer[sizeof(timerDisplayBuffer) - 1] = '\0';
+                    lv_label_set_text_static(ui_TimerLabel, timerDisplayBuffer);
+                } else {
+                    LOG_WARN(TAG_UI, "ui_TimerLabel is NULL, cannot update timer");
                 }
                 break;
 
             case UI_UPDATE_STATUS:
                 if (ui_SerialLabel && ui_SerialLabel1) {
-                    lv_label_set_text(ui_SerialLabel, msg.text);
-                    lv_label_set_text(ui_SerialLabel1, msg.text);
+                    // CRITICAL FIX: Use lv_label_set_text_static() to prevent LVGL realloc bug
+                    strncpy(statusDisplayBuffer, msg.text, sizeof(statusDisplayBuffer) - 1);
+                    statusDisplayBuffer[sizeof(statusDisplayBuffer) - 1] = '\0';
+                    lv_label_set_text_static(ui_SerialLabel, statusDisplayBuffer);
+                    lv_label_set_text_static(ui_SerialLabel1, statusDisplayBuffer);
+
+                    // Also update local status text for consistency
+                    strncpy(currentStatusText, msg.text, sizeof(currentStatusText) - 1);
+                    currentStatusText[sizeof(currentStatusText) - 1] = '\0';
+                } else {
+                    LOG_WARN(TAG_UI, "ui_SerialLabel is NULL, cannot update status");
                 }
-                // Also update local status text for consistency
-                strncpy(currentStatusText, msg.text, sizeof(currentStatusText) - 1);
-                currentStatusText[sizeof(currentStatusText) - 1] = '\0';
                 break;
 
             case UI_UPDATE_CONNECTION:
@@ -468,8 +492,19 @@ static float seconds_f()
  */
 static void updateDisplayRefreshRate(bool active_shot)
 {
+  // SAFETY: Validate LVGL is initialized before accessing display
+  // If called before lv_init() completes, lv_disp_get_default() returns NULL
   lv_disp_t *display = lv_disp_get_default();
+  if (!display) {
+    LOG_WARN(TAG_UI, "updateDisplayRefreshRate() called before LVGL init - skipping");
+    return;
+  }
+
   lv_timer_t *refresh_timer = _lv_disp_get_refr_timer(display);
+  if (!refresh_timer) {
+    LOG_WARN(TAG_UI, "Display refresh timer not available - skipping");
+    return;
+  }
 
   if (active_shot)
   {
@@ -611,7 +646,8 @@ static void handleBLESequence()
 
       LOG_INFO(TAG_SHOT, "BLE: Starting shot - turning ON pump");
       setRelayState(true);              // Turn ON pump (relay)
-      updateDisplayRefreshRate(true);   // 60Hz display mode
+      // REMOVED: updateDisplayRefreshRate() - LVGL call unsafe from Core 0
+      // Now handled by Core 1 main loop polling shot.brewing state
 
       // Enable weight logging during shots
       // scale.setIsBrewing(true);  // ArduinoBLE doesn't have this method
@@ -907,6 +943,28 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
   uint32_t w = (area->x2 - area->x1 + 1);
   uint32_t h = (area->y2 - area->y1 + 1);
 
+  // ===== DEFENSE IN DEPTH: Validate Flush Bounds =====
+  // CRITICAL: Catch corrupted LVGL state BEFORE buffer overrun
+  // If LVGL dirty area tracking is corrupted (from UI modification during render),
+  // it may request flush of areas outside screen bounds → buffer overrun → heap corruption
+  if (area->x1 < 0 || area->x2 >= EXAMPLE_LCD_H_RES ||
+      area->y1 < 0 || area->y2 >= EXAMPLE_LCD_V_RES) {
+    LOG_ERROR(TAG_UI, "🚨 INVALID FLUSH AREA DETECTED - CORRUPTED LVGL STATE!");
+    LOG_ERROR(TAG_UI, "   Requested: (%ld,%ld)-(%ld,%ld), Screen: (%d,%d)-(%d,%d)",
+              area->x1, area->y1, area->x2, area->y2,
+              0, 0, EXAMPLE_LCD_H_RES-1, EXAMPLE_LCD_V_RES-1);
+    LOG_ERROR(TAG_UI, "   Aborting flush to prevent buffer overrun and heap corruption");
+    lv_disp_flush_ready(disp);
+    return;  // Abort this flush - prevent buffer overrun
+  }
+  // ===== END FLUSH BOUNDS VALIDATION =====
+
+  // ===== DIAGNOSTIC: Track Flush Duration =====
+  // Interrupt watchdog timeout is 3000ms - if flush takes >100ms, log warning
+  static unsigned long maxFlushDuration = 0;
+  unsigned long flushStartTime = millis();
+  // ===== END FLUSH DURATION TRACKING (START) =====
+
   // ===== DIAGNOSTIC: Pixel Data Validation =====
   // Log detailed flush information for first 5 flushes to diagnose blank display
   static uint8_t flushDetailCount = 0;
@@ -953,6 +1011,60 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
   }
 #endif
   lcd_PushColors(area->x1, area->y1, w, h, (uint16_t *)&color_p->full);
+
+  // ===== DIAGNOSTIC: Black Screen Detection =====
+  // Monitor pixel content to detect when screen goes black unexpectedly
+  static bool blackScreenDetected = false;
+  uint16_t* pixels = (uint16_t *)&color_p->full;
+
+  // Sample 100 pixels to check if buffer is predominantly black
+  uint32_t totalSamples = min(100u, w * h);
+  uint32_t blackCount = 0;
+  for (uint32_t i = 0; i < totalSamples; i++) {
+    if (pixels[i] == 0x0000) blackCount++;
+  }
+
+  // If >90% black pixels, log detailed diagnostic (once per black screen event)
+  if (blackCount > totalSamples * 0.9) {
+    if (!blackScreenDetected) {
+      blackScreenDetected = true;
+      LOG_ERROR(TAG_UI, "🚨 BLACK SCREEN DETECTED!");
+      LOG_ERROR(TAG_UI, "   Flush area: (%ld,%ld)-(%ld,%ld) = %lux%lu px",
+                area->x1, area->y1, area->x2, area->y2, w, h);
+      LOG_ERROR(TAG_UI, "   Sample: %lu/%lu pixels are black (%.1f%%)",
+                blackCount, totalSamples, (blackCount * 100.0) / totalSamples);
+      LOG_ERROR(TAG_UI, "   First 10 pixels: %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X",
+                pixels[0], pixels[1], pixels[2], pixels[3], pixels[4],
+                pixels[5], pixels[6], pixels[7], pixels[8], pixels[9]);
+      LOG_ERROR(TAG_UI, "   Buffer pointer: %p (initial=%p %s)",
+                color_p, buf_initial, (color_p == buf_initial) ? "SAME" : "MOVED!");
+    }
+  } else {
+    blackScreenDetected = false;  // Reset when normal content resumes
+  }
+  // ===== END BLACK SCREEN DETECTION =====
+
+  // ===== DIAGNOSTIC: Track Flush Duration (END) =====
+  unsigned long flushDuration = millis() - flushStartTime;
+  if (flushDuration > maxFlushDuration) {
+    maxFlushDuration = flushDuration;
+    if (flushDuration > 100) {
+      LOG_WARN(TAG_UI, "⚠️  Display flush took %lums (max so far: %lums) - potential watchdog risk!",
+               flushDuration, maxFlushDuration);
+    }
+  }
+
+  // Log periodic stats every 100 flushes
+  static uint32_t flushCount = 0;
+  static unsigned long totalFlushTime = 0;
+  flushCount++;
+  totalFlushTime += flushDuration;
+
+  if (flushCount % 100 == 0) {
+    LOG_DEBUG(TAG_UI, "📊 Display flush stats: %lu flushes, avg=%lums, max=%lums",
+              flushCount, totalFlushTime / flushCount, maxFlushDuration);
+  }
+  // ===== END FLUSH DURATION TRACKING (END) =====
 
 #ifdef LCD_SPI_DMA
 
@@ -1018,9 +1130,18 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
   static uint8_t historyCount      = 0;
   static uint8_t historyWriteIndex = 0;
 
-  // DIAGNOSTIC: Log I2C touch transaction
+  // ===== I2C ERROR STATISTICS TRACKING =====
+  // Track I2C error statistics for health monitoring
   static uint32_t touchReadCount = 0;
+  static uint32_t totalReads = 0;
+  static uint32_t corruptedReads = 0;
+  static uint32_t timeoutReads = 0;
+  static uint32_t edgeGlitchReads = 0;
+  static unsigned long lastStatsLog = 0;
+
   touchReadCount++;
+  totalReads++;
+  // ===== END I2C ERROR STATISTICS TRACKING =====
 
   // CRITICAL: Match LilyGO lvgl_demo.ino I2C sequence (no error checking on Wire calls)
   // Touch controller I2C state machine gets confused by timing delays from error checks
@@ -1035,10 +1156,25 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
   // Simple 50ms timeout - short enough to not confuse controller timing
   unsigned long timeout_start = millis();
   while (!Wire.available()) {
+    esp_task_wdt_reset();  // CRITICAL: Feed watchdog during I2C wait (prevents watchdog timeout crash)
     if (millis() - timeout_start > 50) {
       break;  // Timeout - read whatever's available (might be zeros)
     }
   }
+
+  // ===== DIAGNOSTIC: I2C Timeout Logging =====
+  // Log when I2C wait times out (indicates bus degradation or controller issues)
+  unsigned long wait_duration = millis() - timeout_start;
+  if (wait_duration >= 50) {
+    timeoutReads++;  // Track timeout statistics
+    static unsigned long lastI2CTimeoutLog = 0;
+    // Log at most once per second to avoid spam
+    if (millis() - lastI2CTimeoutLog > 1000) {
+      LOG_WARN(TAG_UI, "⚠️  I2C timeout: Wire.available() waited %lums (max 50ms)", wait_duration);
+      lastI2CTimeoutLog = millis();
+    }
+  }
+  // ===== END I2C TIMEOUT LOGGING =====
 
   Wire.readBytes(buff, 8);
 
@@ -1056,26 +1192,60 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
   uint16_t rawY = AXS_GET_POINT_Y(buff, 0);
   uint16_t type = AXS_GET_GESTURE_TYPE(buff);
 
-  // CRITICAL: Handle [00 00 00...] and [AF AF AF...] corrupted patterns
-  // These patterns indicate touch controller errors and should be treated as "no touch"
-  // [00 00 00...]: Clean but invalid state (may cause Wire.available() timeout)
-  // [AF AF AF...]: Error state after touch interaction (0xAF = 0xA2 | 0x0D)
-  bool isCorruptedPattern = (buff[0] == 0x00 && buff[1] == 0x00) ||
-                            (buff[0] == 0xAF && buff[1] == 0xAF);
+  // ===== EDGE GLITCH DETECTION =====
+  // Detect touches that jump to screen edges (0 or max coordinates)
+  // These are usually I2C read errors or electrical noise
+  if (!type && (rawX || rawY)) {
+    if ((rawX == 0 || rawX >= EXAMPLE_LCD_V_RES - 1) ||
+        (rawY == 0 || rawY >= EXAMPLE_LCD_H_RES - 1)) {
+      edgeGlitchReads++;
+    }
+  }
+  // ===== END EDGE GLITCH DETECTION =====
 
-  if (isCorruptedPattern) {
-    // Force touch release to prevent LVGL from getting stuck in pressed state
+  // CRITICAL: Distinguish TRUE I2C corruption from normal idle state
+  // [00 00 00...]: TRUE corruption - I2C bus error, invalid data (RARE)
+  // [AF AF AF...]: NORMAL idle state - controller signals "no touch detected" (65% of reads)
+  //
+  // IMPORTANT: This custom CST816 variant (address 0x3B) returns [AF AF...] when idle.
+  // This is NOT an error - it's how this specific controller communicates "no finger detected".
+  // See: LilyGO T-Display-S3-Long reference implementation
+  bool isTrueCorruption = (buff[0] == 0x00 && buff[1] == 0x00);  // Real I2C bus error
+  bool isIdleState = (buff[0] == 0xAF && buff[1] == 0xAF);       // Normal "no touch" signal
+
+  // Handle TRUE corruption (I2C bus errors) - log and track
+  if (isTrueCorruption) {
+    corruptedReads++;  // Track REAL corruption statistics
+
+    // Log TRUE corruption (throttled to once per second)
+    static unsigned long lastCorruptLog = 0;
+    if (millis() - lastCorruptLog > 1000) {
+      LOG_WARN(TAG_UI, "🚨 TRUE I2C bus corruption: [00 00 00 00 00 00 00 00]");
+      lastCorruptLog = millis();
+    }
+
+    // Force touch release
     data->point.x = 0;
     data->point.y = 0;
     data->state = LV_INDEV_STATE_REL;
     return;
   }
 
-  // DIAGNOSTIC: Log parsed touch data when touch detected
-  if (!type && (rawX || rawY)) {
-    LOG_INFO(TAG_UI, "Touch RAW data #%lu: rawX=%d, rawY=%d, type=%d, buff0=0x%02X",
-             touchReadCount, rawX, rawY, type, buff[0]);
+  // Handle normal idle state [AF AF...] - silently return "no touch"
+  if (isIdleState) {
+    // This is NORMAL behavior - don't log, don't count as error
+    // Just return touch release state
+    data->point.x = 0;
+    data->point.y = 0;
+    data->state = LV_INDEV_STATE_REL;
+    return;
   }
+
+  // DIAGNOSTIC: Touch position logging DISABLED for production use
+  // if (!type && (rawX || rawY)) {
+  //   LOG_INFO(TAG_UI, "Touch RAW data #%lu: rawX=%d, rawY=%d, type=%d, buff0=0x%02X",
+  //            touchReadCount, rawX, rawY, type, buff[0]);
+  // }
 
   if (!type && (rawX || rawY))
   {
@@ -1152,6 +1322,7 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
     const lv_coord_t maxX = EXAMPLE_LCD_H_RES - 1;
     const lv_coord_t maxY = EXAMPLE_LCD_V_RES - 1;
 
+    // ===== TOUCH FILTERING: Edge Jump Prevention + 2-Sample Averaging =====
     if (haveLastPoint)
     {
       lv_coord_t deltaX = finalX - lastPointX;
@@ -1170,7 +1341,7 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
         finalY = lastPointY;
       }
 
-      if (deltaX > 50)  // Increased from 24 for slider responsiveness
+      if (deltaX > 300)  // Optimized threshold for slider responsiveness
       {
         finalX = lastPointX;
       }
@@ -1181,27 +1352,12 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
       }
     }
 
-    // 2-sample averaging filter for touch stability
-    historyX[historyWriteIndex] = finalX;
-    historyY[historyWriteIndex] = finalY;
-    historyWriteIndex           = (historyWriteIndex + 1) % filterDepth;
-    if (historyCount < filterDepth)
-      historyCount++;
-
-    lv_coord_t accumX = 0;
-    lv_coord_t accumY = 0;
-    for (uint8_t i = 0; i < historyCount; i++)
-    {
-      accumX += historyX[i];
-      accumY += historyY[i];
-    }
-
-    lv_coord_t filteredX = historyCount ? (accumX / historyCount) : finalX;
-    lv_coord_t filteredY = historyCount ? (accumY / historyCount) : finalY;
-
-    lastPointX    = filteredX;
-    lastPointY    = filteredY;
+    // 2-sample averaging filter DISABLED for maximum responsiveness
+    // Use edge jump prevention only, no averaging
+    lastPointX    = finalX;
+    lastPointY    = finalY;
     haveLastPoint = true;
+    // ===== END TOUCH FILTERING =====
 
     data->state   = LV_INDEV_STATE_PR;
     data->point.x = lastPointX;
@@ -1211,41 +1367,291 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
     extern unsigned long lastTouchEvent;
     lastTouchEvent = millis();
 
-    // Log valid touches (throttled to avoid spam)
-    static unsigned long lastTouchLog = 0;
-    if (millis() - lastTouchLog > 2000) {  // Log every 2 seconds max
-      LOG_DEBUG(TAG_UI, "Touch detected: (%d, %d)", data->point.x, data->point.y);
-      lastTouchLog = millis();
-    }
+    // Log valid touches (DISABLED for production use)
+    // static unsigned long lastTouchLog = 0;
+    // if (millis() - lastTouchLog > 2000) {  // Log every 2 seconds max
+    //   LOG_DEBUG(TAG_UI, "Touch detected: (%d, %d)", data->point.x, data->point.y);
+    //   lastTouchLog = millis();
+    // }
 
-    char buf[20] = {0};
-    sprintf(buf, "(%d, %d)", data->point.x, data->point.y);
+    // CRITICAL FIX: Use lv_label_set_text_static() to prevent heap corruption
+    // my_touchpad_read() is called BY LVGL DURING RENDER - NEVER use realloc here!
+    static char touchCoordBuffer[20];  // Persistent buffer for lv_label_set_text_static
+    sprintf(touchCoordBuffer, "(%d, %d)", data->point.x, data->point.y);
     if (ui_cartext != nullptr)
-      lv_label_set_text(ui_cartext, buf);
+      lv_label_set_text_static(ui_cartext, touchCoordBuffer);
   }
   else
   {
-    // DIAGNOSTIC: Log when touch is released (not every poll, only on state change)
-    static bool wasPressed = false;
-    if (wasPressed) {
-      LOG_INFO(TAG_UI, "Touch RELEASED (no touch detected, type=%d, rawX=%d, rawY=%d)", type, rawX, rawY);
-      wasPressed = false;
-    }
+    // DIAGNOSTIC: Touch release logging DISABLED for production use
+    // static bool wasPressed = false;
+    // if (wasPressed) {
+    //   LOG_INFO(TAG_UI, "Touch RELEASED (no touch detected, type=%d, rawX=%d, rawY=%d)", type, rawX, rawY);
+    //   wasPressed = false;
+    // }
 
     data->state = LV_INDEV_STATE_REL;
     haveLastPoint     = false;
     historyCount      = 0;
     historyWriteIndex = 0;
 
-    // Track if we were just pressed (for next cycle logging)
-    if (data->state == LV_INDEV_STATE_PR) {
-      wasPressed = true;
-    }
+    // Track if we were just pressed (DISABLED - for touch logging only)
+    // if (data->state == LV_INDEV_STATE_PR) {
+    //   wasPressed = true;
+    // }
   }
+
+  // ===== I2C HEALTH STATISTICS LOGGING =====
+  // Log I2C touch controller health statistics every 10 seconds
+  // NOTE: "Corrupted" = TRUE I2C bus errors [00 00...] ONLY
+  //       [AF AF...] idle state is NOT counted (that's normal operation)
+  if (millis() - lastStatsLog > 10000 && totalReads > 0) {
+    float corruptRate = (corruptedReads * 100.0f) / totalReads;
+    float timeoutRate = (timeoutReads * 100.0f) / totalReads;
+    float glitchRate = (edgeGlitchReads * 100.0f) / totalReads;
+
+    LOG_INFO(TAG_UI, "📊 I2C Touch Health (last 10s):");
+    LOG_INFO(TAG_UI, "  Total reads: %lu", totalReads);
+    LOG_INFO(TAG_UI, "  TRUE Corruptions [00 00...]: %lu (%.1f%%) (Note: [AF AF...] idle NOT counted)", corruptedReads, corruptRate);
+    LOG_INFO(TAG_UI, "  Timeouts: %lu (%.1f%%)", timeoutReads, timeoutRate);
+    LOG_INFO(TAG_UI, "  Edge glitches: %lu (%.1f%%)", edgeGlitchReads, glitchRate);
+
+    // Reset counters for next window
+    totalReads = 0;
+    corruptedReads = 0;
+    timeoutReads = 0;
+    edgeGlitchReads = 0;
+    lastStatsLog = millis();
+  }
+  // ===== END I2C HEALTH STATISTICS LOGGING =====
+}
+
+// =============================================================================
+// LAYER 3: BLE COMMAND INTERFACE (Core 1 → Core 0 Queue)
+// Non-blocking command queue - all BLE operations happen on Core 0
+// =============================================================================
+
+/**
+ * @brief Queue TARE command to BLE task (non-blocking)
+ * Called from Layer 2 brew functions (Core 1)
+ * Executed on Core 0 by processBLECommand()
+ */
+void bleCommand_Tare()
+{
+    BLECommandMessage cmd;
+    cmd.command = BLE_CMD_TARE;
+    cmd.param = 0;
+
+    if (xQueueSend(bleCommandQueue, &cmd, 0) == pdTRUE) {
+        LOG_DEBUG(TAG_TASK, "TARE command queued");
+    } else {
+        LOG_ERROR(TAG_TASK, "Failed to queue TARE command (queue full)");
+        queueScaleStatus("Command queue full");
+    }
+}
+
+/**
+ * @brief Queue STOP_TIMER command to BLE task (PRIORITY - flushes queue)
+ * Called from Layer 2 brew functions (Core 1)
+ * Executed on Core 0 by processBLECommand()
+ *
+ * STOP is a priority/safety command:
+ * - Flushes all pending commands from queue
+ * - Ensures STOP executes immediately
+ * - Prevents stale commands (TARE/START) from executing after STOP
+ */
+void bleCommand_StopTimer()
+{
+    // STOP is emergency - flush all pending commands from queue!
+    BLECommandMessage discarded;
+    uint8_t flushedCount = 0;
+    while (xQueueReceive(bleCommandQueue, &discarded, 0) == pdTRUE) {
+        LOG_WARN(TAG_TASK, "STOP: Flushed pending command %d from queue", discarded.command);
+        flushedCount++;
+    }
+
+    if (flushedCount > 0) {
+        LOG_INFO(TAG_TASK, "STOP: Flushed %d pending commands", flushedCount);
+    }
+
+    // Now queue the STOP command (queue should be empty)
+    BLECommandMessage cmd;
+    cmd.command = BLE_CMD_STOP_TIMER;
+    cmd.param = 0;
+
+    if (xQueueSend(bleCommandQueue, &cmd, 0) == pdTRUE) {
+        LOG_DEBUG(TAG_TASK, "STOP_TIMER command queued (priority)");
+    } else {
+        // Should never happen since we just flushed the queue
+        LOG_ERROR(TAG_TASK, "Failed to queue STOP after flush - critical error!");
+        queueScaleStatus("STOP failed - retry");
+    }
+}
+
+/**
+ * @brief Trigger BLE shot start sequence (non-blocking)
+ * Called from Layer 2 brew functions (Core 1)
+ * Uses state machine (already non-blocking)
+ */
+void bleCommand_StartShotSequence()
+{
+    bleSequenceInProgress = true;
+    bleSequenceState = BLE_SEND_RESET;
+    bleSequenceTimestamp = millis();
+    LOG_DEBUG(TAG_TASK, "Shot sequence triggered");
+}
+
+// =============================================================================
+// LAYER 2: BREW FUNCTIONS (Core 1)
+// Business logic, state validation, relay control
+// Queue BLE commands (NEVER call scale.* directly!)
+// =============================================================================
+
+/**
+ * @brief Start brewing shot (Layer 2 business logic)
+ * Called from UI Layer 1 (ui_event_StartButton)
+ * Validates state, queues BLE commands, controls relay
+ */
+void brewFunction_Start()
+{
+    // Validate state
+    if (shot.brewing) {
+        queueScaleStatus("Already brewing");
+        return;
+    }
+
+    if (isFlushing) {
+        LOG_INFO(TAG_SHOT, "Flushing cancelled - brew start requested");
+        setRelayState(false);
+        isFlushing = false;
+    }
+
+    // Check connection (non-blocking read)
+    if (!scale.isConnected()) {
+        queueScaleStatus("Scale not connected");
+        shot.brewing = false;
+        isFlushing = false;
+        return;
+    }
+
+    LOG_INFO(TAG_SHOT, "Shot start requested - triggering BLE sequence");
+
+    // Update state
+    shot.shotTimer = 0.0f;
+    shot.datapoints = 0;
+
+    // Queue BLE commands (non-blocking!)
+    bleCommand_StartShotSequence();  // ← Layer 3
+
+    // Note: shot.brewing will be set to true in BLE_START_SHOT state after commands complete
+    // Feedback happens via BLE task callbacks
+}
+
+/**
+ * @brief Stop brewing shot (Layer 2 business logic)
+ * Called from UI Layer 1 (ui_event_StopButton) or watchdogs (Core 0)
+ * Validates state, queues BLE commands, controls relay
+ */
+void brewFunction_Stop(ShotEndReason reason)
+{
+    bool wasBrewing = shot.brewing;
+
+    // Update state immediately
+    shot.brewing = false;
+    isFlushing = false;
+    shot.endReason = reason;
+    lastTimerUpdate = 0;  // Reset timer update tracking
+
+    LOG_INFO(TAG_SHOT, "ShotEnded");
+
+    // Calculate shot duration if we were brewing
+    if (wasBrewing) {
+        shot.end_s = seconds_f() - shot.start_timestamp_s;
+    }
+
+    // Queue BLE command (non-blocking!) - REMOVED blocking scale.stopTimer() call
+    if (scale.isConnected()) {
+        bleCommand_StopTimer();  // ← Layer 3 (non-blocking!)
+    }
+
+    // Control relay (immediate hardware response - critical for safety!)
+    setRelayState(false);
+    // REMOVED: updateDisplayRefreshRate() - LVGL call unsafe from Core 0
+    // Now handled by Core 1 main loop polling shot.brewing state
+
+    // Feedback
+    if (wasBrewing) {
+        queueScaleStatus("Shot stopped");
+    }
+}
+
+/**
+ * @brief Tare scale (Layer 2 business logic)
+ * Called from UI Layer 1 (ui_event_ScaleResetButton)
+ * Validates state, queues BLE command
+ */
+void brewFunction_TareScale()
+{
+    // Validate connection (non-blocking read)
+    if (!scale.isConnected()) {
+        queueScaleStatus("Scale not connected");
+        return;
+    }
+
+    // Queue BLE command (non-blocking!) - REMOVED blocking scale.tare() call
+    bleCommand_Tare();  // ← Layer 3 (non-blocking!)
+
+    // Immediate feedback
+    queueScaleStatus("Tare requested...");
+}
+
+/**
+ * @brief Start flushing cycle (Layer 2 business logic)
+ * Called from UI Layer 1 (ui_event_FlushButton)
+ * No BLE needed - pure relay control
+ */
+void brewFunction_StartFlush()
+{
+    // Validate
+    if (shot.brewing) {
+        queueScaleStatus("Cannot flush while brewing");
+        return;
+    }
+
+    // Control relay (no BLE needed!)
+    flushMessageActive = false;
+    setRelayState(true);          // Turn on pump
+    startTimeFlushing = millis(); // Record start time
+    isFlushing = true;            // Set flushing flag
+
+    // Feedback
+    queueScaleStatus("Flushing...");
+    LOG_INFO(TAG_UI, "Flushing started");
+    enforceRelayState();
+}
+
+/**
+ * @brief Reset shot timer (Layer 2 business logic)
+ * Called from UI Layer 1 (ui_event_TimerResetButton)
+ * Pure UI operation - no BLE, no relay
+ * CRITICAL FIX: Use queue pattern to prevent UI modification during LVGL render
+ */
+void brewFunction_ResetTimer()
+{
+    // Reset timer state
+    shot.shotTimer = 0.0f;
+
+    // CRITICAL FIX: Queue UI update instead of direct lv_label_set_text()
+    // This prevents realloc() during LVGL render phase (heap corruption bug fix)
+    char buffer[10];
+    dtostrf(shot.shotTimer, 5, 1, buffer);
+    queueUIUpdate(UI_UPDATE_TIMER, buffer);
+
+    LOG_DEBUG(TAG_UI, "Timer reset to 0.0");
 }
 
 // -----------------------------------------------------------------------------
-// LVGL Event Handlers
+// LVGL Event Handlers (Layer 1: UI Touch)
 // -----------------------------------------------------------------------------
 
 void ui_event_FlushButton(lv_event_t *e)
@@ -1285,15 +1691,8 @@ void ui_event_FlushButton(lv_event_t *e)
   {
     if (!isFlushing)
     {
-      if (shot.brewing)
-      {
-        queueScaleStatus("Cannot flush while shot running");
-        return;
-      }
-
       LOG_INFO(TAG_UI, "Flush activated (%lums press)", millis() - pressedAt);
-
-      flushingFeature();
+      brewFunction_StartFlush();  // Layer 2: Non-blocking brew function
     }
     pressedAt = 0;  // Reset
   }
@@ -1318,7 +1717,7 @@ void ui_event_StartButton(lv_event_t *e)
   if (event_code == LV_EVENT_CLICKED && (millis() - pressedAt) >= HUMAN_TOUCH_MIN_MS)
   {
     setStatusLabels("Start Button Pressed");
-    startBrew();
+    brewFunction_Start();  // Layer 2: Non-blocking brew function
   }
 }
 
@@ -1336,7 +1735,7 @@ void ui_event_StopButton(lv_event_t *e)
   if (event_code == LV_EVENT_CLICKED && (millis() - pressedAt) >= HUMAN_TOUCH_MIN_MS)
   {
     setStatusLabels("Stop Button Pressed");
-    stopBrew(false, BUTTON_PRESSED);
+    brewFunction_Stop(BUTTON_PRESSED);  // Layer 2: Non-blocking brew function
   }
 }
 
@@ -1353,19 +1752,7 @@ void ui_event_ScaleResetButton(lv_event_t *e)
 
   if (event_code == LV_EVENT_CLICKED && (millis() - pressedAt) >= HUMAN_TOUCH_MIN_MS)
   {
-    if (!scale.isConnected())
-    {
-      queueScaleStatus("Scale not connected");
-      return;
-    }
-
-    if (!scale.tare())
-    {
-      setStatusLabels("Scale tare failed");
-      return;
-    }
-
-    setStatusLabels("Scale Tared.");
+    brewFunction_TareScale();  // Layer 2: Non-blocking brew function
   }
 }
 
@@ -1412,10 +1799,7 @@ void ui_event_TimerResetButton(lv_event_t *e)
 
   if (event_code == LV_EVENT_CLICKED && (millis() - pressedAt) >= HUMAN_TOUCH_MIN_MS)
   {
-    char buffer[5];
-    shot.shotTimer = 0;
-    dtostrf(shot.shotTimer, 5, 1, buffer);
-    lv_label_set_text(ui_TimerLabel, buffer);
+    brewFunction_ResetTimer();  // Layer 2: Non-blocking brew function
   }
 }
 
@@ -1525,7 +1909,7 @@ void checkScaleStatus()
 
     if (shot.brewing)
     {
-      stopBrew(false, SCALE_DISCONNECTED);
+      brewFunction_Stop(SCALE_DISCONNECTED);  // Layer 2: Non-blocking (safe from Core 0)
     }
   }
   else
@@ -1622,12 +2006,13 @@ static void updateScaleReadings()
 
   currentWeight = scale.getWeight();
 
-  // CRITICAL FIX: Throttle UI updates to prevent watchdog timeout
-  // Rate limit weight updates to 10Hz (100ms) to prevent UI queue overflow
+  // CRITICAL FIX: Throttle UI updates to prevent watchdog timeout and LVGL realloc bugs
+  // Rate limit weight updates to 5Hz (200ms) to reduce LVGL memory allocator stress
   // Without throttling, 3-4 updates/sec fills queue → processUIUpdates() blocks → watchdog timeout
+  // Reduced from 10Hz (100ms) to 5Hz (200ms) to mitigate LVGL v8.3.0-dev realloc bugs
   static unsigned long lastWeightUIUpdate = 0;
   static float lastUIWeight = 0;
-  const unsigned long WEIGHT_UI_UPDATE_INTERVAL = 100;  // 100ms = 10Hz max UI updates
+  const unsigned long WEIGHT_UI_UPDATE_INTERVAL = 200;  // 200ms = 5Hz max UI updates (was 100ms = 10Hz)
 
   unsigned long now = millis();
   bool weightChanged = fabs(currentWeight - lastUIWeight) > 0.1;  // >0.1g change
@@ -1716,14 +2101,14 @@ static void handleShotWatchdogs()
   {
     LOG_WARN(TAG_SHOT, "Max brew duration reached");
     setStatusLabels("Max brew duration reached");
-    stopBrew(false, TIME_EXCEEDED);
+    brewFunction_Stop(TIME_EXCEEDED);  // Layer 2: Non-blocking (safe from Core 0)
   }
 
   if (shot.brewing && shot.shotTimer >= shot.expected_end_s && shot.shotTimer > MIN_SHOT_DURATION_S)
   {
     LOG_INFO(TAG_SHOT, "Weight achieved");
     setStatusLabels("Weight achieved");
-    stopBrew(false, WEIGHT_ACHIEVED);
+    brewFunction_Stop(WEIGHT_ACHIEVED);  // Layer 2: Non-blocking (safe from Core 0)
   }
 
   if (shot.start_timestamp_s && shot.end_s && currentWeight >= (goalWeight - weightOffset) &&
@@ -1781,6 +2166,15 @@ void LVGLTimerHandlerRoutine()
 
   if (transfer_num <= 0 && lcd_PushColors_len <= 0)
   {
+    // ===== DIAGNOSTIC: LVGL Timer Heartbeat =====
+    // Log BEFORE calling lv_timer_handler() to prove we reached this point
+    static unsigned long lastLvglHeartbeat = 0;
+    if (now - lastLvglHeartbeat > 1000) {  // Every 1 second
+      LOG_DEBUG(TAG_UI, "❤️  LVGL Timer alive: about to call lv_timer_handler()");
+      lastLvglHeartbeat = now;
+    }
+    // ===== END LVGL TIMER HEARTBEAT =====
+
     lv_timer_handler();
     lastLVGLTimerCall = now;
     lvglTimerCallCount++;
@@ -1818,9 +2212,16 @@ void setup()
   // 4. DEBUG_INIT() - WiFi setup (debug builds only), re-calls Serial.begin() safely
   // =============================================================================
 
+  unsigned long setupStartTime = millis();  // Track total setup duration
+
+  // Reduce CPU frequency for lower power consumption and heat generation
+  // 160 MHz = 33% less power than 240 MHz, still fast enough for LVGL @ 60 Hz + BLE
+  setCpuFrequencyMhz(160);
+
   // Step 0: Initialize NVS (Non-Volatile Storage) FIRST - before WiFi or BLE
   // This prevents both radios from trying to initialize NVS independently
   // Critical for WiFi+BLE coexistence on ESP32-S3
+  unsigned long phaseStartTime = millis();
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     nvs_flash_erase();
@@ -1830,6 +2231,9 @@ void setup()
   // Step 1: Initialize Serial (production builds need this, debug builds will re-init)
   Serial.begin(115200);
   delay(500);  // Delay for Serial to stabilize (increased for reliability)
+
+  // DIAGNOSTIC: Log NVS + Serial init duration (early boot, before mutex)
+  Serial.printf("⏱️  SETUP[%04lums]: NVS + Serial initialized\n", millis() - setupStartTime);
 
   // Step 2: Create serial mutex BEFORE any LOG_*() calls
   // This prevents output fragmentation when multiple tasks print simultaneously
@@ -1846,8 +2250,10 @@ void setup()
   // Mutex created successfully - can now use LOG_*() macros safely
   LOG_INFO(TAG_SYS, "");
   LOG_INFO(TAG_SYS, "=== BOOT START ===");
+  LOG_INFO(TAG_SYS, "CPU frequency: %d MHz (reduced from 240 MHz for power savings)", getCpuFrequencyMhz());
   LOG_INFO(TAG_SYS, "Serial initialized @ 115200 baud");
   LOG_INFO(TAG_SYS, "FreeRTOS mutex created successfully");
+  LOG_INFO(TAG_SYS, "⏱️  SETUP[%04lums]: Mutex created", millis() - setupStartTime);
 
   // Log reset reason - WHY did we boot? (FORCE with raw Serial to bypass log filtering)
   esp_reset_reason_t reset_reason = esp_reset_reason();
@@ -1884,13 +2290,13 @@ void setup()
     Serial.println("║  🚨 INTERRUPT WATCHDOG TIMEOUT!          ║");
     Serial.println("║                                           ║");
     Serial.println("║  An ISR (interrupt) ran too long         ║");
-    Serial.println("║  Timeout: 1000ms (increased from 300ms)  ║");
+    Serial.println("║  Timeout: 3000ms (increased from 300ms)  ║");
     Serial.println("║                                           ║");
     Serial.println("║  Likely causes:                          ║");
-    Serial.println("║  • BLE notification handler blocking     ║");
+    Serial.println("║  • BLE writeValue() blocking             ║");
     Serial.println("║  • Display SPI DMA stall                 ║");
-    Serial.println("║  • Touch I2C interrupt conflict          ║");
-    Serial.println("║  • LVGL rendering during critical section║");
+    Serial.println("║  • Touch I2C blocking                    ║");
+    Serial.println("║  • Setup phase hang                      ║");
     Serial.println("╚═══════════════════════════════════════════╝");
   } else if (reset_reason == ESP_RST_PANIC) {
     Serial.println("║                                           ║");
@@ -1906,12 +2312,14 @@ void setup()
   // Step 3: Initialize ArduinoBLE (creates HCI stream buffers for BLE communication)
   LOG_INFO(TAG_SYS, "");
   LOG_INFO(TAG_SYS, "=== Initializing ArduinoBLE ===");
+  phaseStartTime = millis();
   if (!BLE.begin()) {
     LOG_ERROR(TAG_SYS, "❌ ArduinoBLE initialization failed!");
     LOG_ERROR(TAG_SYS, "System halted - BLE init is critical for scale connection");
     while(1) delay(1000);  // Halt - BLE init failure is unrecoverable
   }
   LOG_INFO(TAG_SYS, "✅ ArduinoBLE initialized - HCI stream buffers ready");
+  LOG_INFO(TAG_SYS, "⏱️  SETUP[%04lums]: ArduinoBLE init took %lums", millis() - setupStartTime, millis() - phaseStartTime);
 
   // BACKUP: Log reset reason again via LOG_ERROR (in case raw Serial was missed)
   // This provides redundancy if USB CDC wasn't connected during early boot
@@ -1920,13 +2328,16 @@ void setup()
   // Step 4: Initialize WiFi (debug builds only) via DEBUG_INIT()
   // NimBLE is already running, WiFi will coexist properly
   // Note: DEBUG_INIT() calls Serial.begin() again - this is safe (no-op on already-initialized serial)
+  phaseStartTime = millis();
   DEBUG_INIT();  // Production: no-op, Debug builds: WiFi+WebSerial setup
   delay(500);    // Brief delay for WiFi connection (if enabled)
+  LOG_INFO(TAG_SYS, "⏱️  SETUP[%04lums]: WiFi/Debug init took %lums", millis() - setupStartTime, millis() - phaseStartTime);
 
   LOG_INFO(TAG_SYS, "=== Gravimetric Shots Initializing ===");
 
   // Initialize PMU (Power Management Unit) for LED control
   // T-Display-S3-Long uses SY6970 on I2C pins: SDA=15, SCL=10 (same as touch)
+  phaseStartTime = millis();
   Wire.begin(TOUCH_IICSDA, TOUCH_IICSCL);  // Touch controller pins (also used for PMU)
   Wire.setClock(100000);  // 100kHz for reliability under thermal stress
   if (PMU.init(Wire, TOUCH_IICSDA, TOUCH_IICSCL, SY6970_SLAVE_ADDRESS))
@@ -1938,14 +2349,17 @@ void setup()
   {
     LOG_WARN(TAG_SYS, "PMU init failed (LED control unavailable)");
   }
+  LOG_INFO(TAG_SYS, "⏱️  SETUP[%04lums]: PMU init took %lums", millis() - setupStartTime, millis() - phaseStartTime);
 
   // Initialize task watchdog (20 second timeout) - auto-reboot on hang
   // CRITICAL: Increased from 10s to 20s to accommodate BLE discovery delays
   // peripheral.discoverAttributes() can take 1-10+ seconds during reconnection
   // 20s provides safety margin while still catching real freezes
+  phaseStartTime = millis();
   esp_task_wdt_init(20, true);  // 20s timeout, panic & reboot on trigger
   esp_task_wdt_add(NULL);       // Add current task to watchdog
   LOG_INFO(TAG_SYS, "Task watchdog enabled (20s timeout)");
+  LOG_INFO(TAG_SYS, "⏱️  SETUP[%04lums]: Watchdog init took %lums", millis() - setupStartTime, millis() - phaseStartTime);
 
   preferences.begin("myApp", false);                       // Open the preferences with a namespace and read-only flag
   brightness = preferences.getInt(BRIGHTNESS_KEY, 0);      // Read the brightness value from preferences
@@ -2021,15 +2435,49 @@ void setup()
   LOG_INFO(TAG_UI, "  🔬 TOUCH CONTROLLER (CST816) INITIALIZATION TEST");
   LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
   LOG_INFO(TAG_UI, "Touch reset: GPIO %d (toggled LOW 10ms, now HIGH)", TOUCH_RES);
-  LOG_INFO(TAG_UI, "I2C pins: SDA=GPIO %d, SCL=GPIO %d, freq=100kHz", TOUCH_IICSDA, TOUCH_IICSCL);
+  LOG_INFO(TAG_UI, "I2C pins: SDA=GPIO %d, SCL=GPIO %d", TOUCH_IICSDA, TOUCH_IICSCL);
 
   delay(50);  // Give touch controller time to boot after reset
 
-  // Test I2C communication with touch controller
+  // ===== I2C BUS SPEED TESTING =====
+  // Test different I2C clock speeds to find optimal reliability
+  LOG_INFO(TAG_UI, "Testing I2C bus speeds...");
+
+  // Test 100 kHz (current default)
+  Wire.setClock(100000);
+  delay(100);
+  Wire.beginTransmission(0x3B);
+  uint8_t err_100k = Wire.endTransmission();
+  LOG_INFO(TAG_UI, "  100 kHz: %s (error=%d)", err_100k == 0 ? "✅ ACK" : "❌ NACK", err_100k);
+
+  // Test 50 kHz (slower = more reliable in noisy environment)
+  Wire.setClock(50000);
+  delay(100);
+  Wire.beginTransmission(0x3B);
+  uint8_t err_50k = Wire.endTransmission();
+  LOG_INFO(TAG_UI, "  50 kHz: %s (error=%d)", err_50k == 0 ? "✅ ACK" : "❌ NACK", err_50k);
+
+  // Test 20 kHz (very slow but maximum reliability)
+  Wire.setClock(20000);
+  delay(100);
+  Wire.beginTransmission(0x3B);
+  uint8_t err_20k = Wire.endTransmission();
+  LOG_INFO(TAG_UI, "  20 kHz: %s (error=%d)", err_20k == 0 ? "✅ ACK" : "❌ NACK", err_20k);
+
+  // Use 100 kHz as default (standard I2C speed)
+  Wire.setClock(100000);
+  LOG_INFO(TAG_UI, "Using 100 kHz I2C clock (standard speed)");
+  LOG_INFO(TAG_UI, "");
+  LOG_INFO(TAG_UI, "ℹ️  IMPORTANT: This custom CST816 variant returns [AF AF AF...] when idle.");
+  LOG_INFO(TAG_UI, "   This is NORMAL behavior - NOT an error. Controller signals 'no touch'.");
+  LOG_INFO(TAG_UI, "   Only [00 00 00...] patterns indicate true I2C bus corruption.");
+  // ===== END I2C BUS SPEED TESTING =====
+
+  // Final ACK test at chosen speed
   Wire.beginTransmission(0x3B);
   uint8_t i2c_test_error = Wire.endTransmission();
   if (i2c_test_error == 0) {
-    LOG_INFO(TAG_UI, "✅ Touch controller ACK at address 0x3B");
+    LOG_INFO(TAG_UI, "✅ Touch controller ACK at address 0x3B (100 kHz)");
   } else {
     LOG_ERROR(TAG_UI, "❌ Touch controller NO ACK at 0x3B (error=%d)", i2c_test_error);
     LOG_ERROR(TAG_UI, "   Error codes: 1=too long, 2=NACK addr, 3=NACK data, 4=other");
@@ -2045,9 +2493,13 @@ void setup()
   pinMode(TFT_BL, OUTPUT);    // initialized TFT Backlight Pin as output
   digitalWrite(TFT_BL, LOW);  // Keep backlight OFF during initialization to prevent noise/garbage display
 
+  phaseStartTime = millis();
   axs15231_init(); // initialized Screen
+  LOG_INFO(TAG_SYS, "⏱️  SETUP[%04lums]: Display init took %lums", millis() - setupStartTime, millis() - phaseStartTime);
 
+  phaseStartTime = millis();
   lv_init(); // initialized LVGL
+  LOG_INFO(TAG_SYS, "⏱️  SETUP[%04lums]: LVGL init took %lums", millis() - setupStartTime, millis() - phaseStartTime);
 
   // ===== DIAGNOSTIC: Register LVGL log callback =====
   // Route LVGL internal logs through our logging system
@@ -2175,7 +2627,9 @@ void setup()
   }
   // ===== END DIAGNOSTIC =====
 
+  phaseStartTime = millis();
   ui_init(); // initialized LVGL UI intereface
+  LOG_INFO(TAG_SYS, "⏱️  SETUP[%04lums]: UI init took %lums", millis() - setupStartTime, millis() - phaseStartTime);
 
   // ===== DIAGNOSTIC: LVGL Widget Tree Validation =====
   LOG_INFO(TAG_UI, "═══════════════════════════════════════════════");
@@ -2252,17 +2706,21 @@ void setup()
 
   // initialized the Backlight Slider and Label Value
   lv_slider_set_value(ui_BacklightSlider, brightness, LV_ANIM_OFF);
-  char buffer[10]; // Make sure the buffer is large enough to hold the result
-  char prefixedBuffer[10];
+
+  // CRITICAL FIX: Use lv_label_set_text_static() to prevent heap corruption
+  // Even in setup(), using _static is safer and consistent with rest of codebase
+  static char backlightLabelBuffer[10];
+  static char presetWeightLabelBuffer[10];
+  char buffer[10];
 
   dtostrf(brightness, 3, 0, buffer);
-  snprintf(prefixedBuffer, sizeof(prefixedBuffer), "%s %%", buffer);
-  lv_label_set_text(ui_BacklightLabel, prefixedBuffer);
+  snprintf(backlightLabelBuffer, sizeof(backlightLabelBuffer), "%s %%", buffer);
+  lv_label_set_text_static(ui_BacklightLabel, backlightLabelBuffer);
 
   // Initialized PresetWeight Slider and Label Value.
   dtostrf(goalWeight, 3, 0, buffer);
-  snprintf(prefixedBuffer, sizeof(prefixedBuffer), "%s g", buffer);
-  lv_label_set_text(ui_PresetWeightLabel, prefixedBuffer);
+  snprintf(presetWeightLabelBuffer, sizeof(presetWeightLabelBuffer), "%s g", buffer);
+  lv_label_set_text_static(ui_PresetWeightLabel, presetWeightLabelBuffer);
 
 
   LOG_INFO(TAG_SYS, "Flash size: %u bytes", ESP.getFlashChipSize());
@@ -2310,6 +2768,14 @@ void setup()
   vTaskDelay(pdMS_TO_TICKS(500));
 
   LOG_INFO(TAG_TASK, "BLE task created successfully, main loop on Core %d", xPortGetCoreID());
+
+  // ===== SETUP COMPLETE =====
+  LOG_INFO(TAG_SYS, "");
+  LOG_INFO(TAG_SYS, "╔═══════════════════════════════════════════╗");
+  LOG_INFO(TAG_SYS, "║  ✅ SETUP COMPLETE                        ║");
+  LOG_INFO(TAG_SYS, "║  Total duration: %04lums                  ║", millis() - setupStartTime);
+  LOG_INFO(TAG_SYS, "╚═══════════════════════════════════════════╝");
+  LOG_INFO(TAG_SYS, "");
 }
 
 // -----------------------------------------------------------------------------
@@ -2319,41 +2785,83 @@ void setup()
 // Process commands from main loop
 void processBLECommand(BLECommandMessage& cmd)
 {
+    // ===== DIAGNOSTIC: Track BLE Command Duration =====
+    unsigned long cmdStartTime = millis();
+    const char* cmdName = "UNKNOWN";
+    // ===== END BLE COMMAND DURATION TRACKING (START) =====
+
     switch (cmd.command)
     {
         case BLE_CMD_TARE:
+            cmdName = "TARE";
             LOG_DEBUG(TAG_TASK, "Command: TARE");
-            bleSequenceState = BLE_SEND_TARE;
-            bleSequenceInProgress = true;
+            // Direct BLE call (runs on Core 0, safe to block)
+            // This handles standalone tare (Tare button), not shot sequence tare
+            if (scale.isConnected()) {
+                unsigned long tareStartTime = millis();
+                if (scale.tare()) {
+                    LOG_DEBUG(TAG_TASK, "⏱️  BLE tare() took %lums", millis() - tareStartTime);
+                    queueScaleStatus("Scale tared");
+                } else {
+                    LOG_WARN(TAG_TASK, "⏱️  BLE tare() FAILED after %lums", millis() - tareStartTime);
+                    queueScaleStatus("Tare failed");
+                }
+            } else {
+                queueScaleStatus("Scale not connected");
+            }
             break;
 
         case BLE_CMD_START_TIMER:
+            cmdName = "START_TIMER";
             LOG_DEBUG(TAG_TASK, "Command: START_TIMER");
             bleSequenceState = BLE_SEND_START;
             bleSequenceInProgress = true;
             break;
 
         case BLE_CMD_STOP_TIMER:
+            cmdName = "STOP_TIMER";
             LOG_DEBUG(TAG_TASK, "Command: STOP_TIMER");
-            // Implement stop logic if needed
+            // Direct BLE call (runs on Core 0, safe to block)
+            if (scale.isConnected()) {
+                unsigned long stopStartTime = millis();
+                if (scale.stopTimer()) {
+                    LOG_DEBUG(TAG_TASK, "⏱️  BLE stopTimer() took %lums", millis() - stopStartTime);
+                    queueScaleStatus("Timer stopped");
+                } else {
+                    LOG_WARN(TAG_TASK, "⏱️  BLE stopTimer() FAILED after %lums", millis() - stopStartTime);
+                    queueScaleStatus("Stop timer failed");
+                }
+            } else {
+                queueScaleStatus("Scale not connected");
+            }
             break;
 
         case BLE_CMD_RESET_TIMER:
+            cmdName = "RESET_TIMER";
             LOG_DEBUG(TAG_TASK, "Command: RESET_TIMER");
             bleSequenceState = BLE_SEND_RESET;
             bleSequenceInProgress = true;
             break;
 
         case BLE_CMD_DISCONNECT:
+            cmdName = "DISCONNECT";
             LOG_DEBUG(TAG_TASK, "Command: DISCONNECT");
             // scale.disconnect();  // Implement if needed
             break;
 
         case BLE_CMD_FORCE_RECONNECT:
+            cmdName = "FORCE_RECONNECT";
             LOG_DEBUG(TAG_TASK, "Command: FORCE_RECONNECT");
             // Force reconnection logic
             break;
     }
+
+    // ===== DIAGNOSTIC: Track BLE Command Duration (END) =====
+    unsigned long cmdDuration = millis() - cmdStartTime;
+    if (cmdDuration > 1000) {
+        LOG_WARN(TAG_TASK, "⚠️  BLE command %s took %lums (>1s) - potential watchdog risk!", cmdName, cmdDuration);
+    }
+    // ===== END BLE COMMAND DURATION TRACKING (END) =====
 }
 
 // BLE Task Function - Runs continuously on Core 0
@@ -2390,6 +2898,10 @@ void bleTaskFunction(void* parameter)
     unsigned long lastHeapLog = 0;
     const unsigned long HEAP_LOG_INTERVAL_MS = 30000;  // Log heap every 30 seconds
 
+    // ===== DIAGNOSTIC: Core 0 Heartbeat Logging =====
+    unsigned long lastCore0Heartbeat = 0;
+    // ===== END CORE 0 HEARTBEAT LOGGING (SETUP) =====
+
     while (true)
     {
         // Reset watchdog and track timing
@@ -2403,6 +2915,14 @@ void bleTaskFunction(void* parameter)
                       bleTaskWDTResets, now - lastBLEWDTLog);
             lastBLEWDTLog = now;
         }
+
+        // ===== DIAGNOSTIC: Core 0 Heartbeat Logging =====
+        // Log Core 0 alive every 1 second to detect freezes
+        if (now - lastCore0Heartbeat > 1000) {
+            LOG_DEBUG(TAG_TASK, "💓 Core 0 BLE task alive @ %lums", now);
+            lastCore0Heartbeat = now;
+        }
+        // ===== END CORE 0 HEARTBEAT LOGGING =====
 
         // Log heap status every 30 seconds (detects memory leaks from BLE scanning)
         if (now - lastHeapLog > HEAP_LOG_INTERVAL_MS) {
@@ -2429,10 +2949,20 @@ void bleTaskFunction(void* parameter)
             lastHeapLog = now;
         }
 
+        // ===== DIAGNOSTIC: Track Critical Section Durations =====
+        unsigned long sectionStartTime;
+        unsigned long sectionDuration;
+        // ===== END CRITICAL SECTION DURATION TRACKING (SETUP) =====
+
         // Process commands from main loop (non-blocking check)
         BLECommandMessage cmd;
         if (xQueueReceive(bleCommandQueue, &cmd, 0) == pdTRUE) {
+            sectionStartTime = millis();
             processBLECommand(cmd);
+            sectionDuration = millis() - sectionStartTime;
+            if (sectionDuration > 1000) {
+                LOG_WARN(TAG_TASK, "⚠️  processBLECommand() took %lums (>1s)", sectionDuration);
+            }
         }
 
         // CRITICAL FIX: Always call update() to drive state machine
@@ -2440,13 +2970,28 @@ void bleTaskFunction(void* parameter)
         // scale.update();  // Not needed for ArduinoBLE
 
         // Check scale status and manage connection
+        sectionStartTime = millis();
         checkScaleStatus();
+        sectionDuration = millis() - sectionStartTime;
+        if (sectionDuration > 1000) {
+            LOG_WARN(TAG_TASK, "⚠️  checkScaleStatus() took %lums (>1s)", sectionDuration);
+        }
 
         // Send heartbeat to keep connection alive
+        sectionStartTime = millis();
         checkHeartBreat();
+        sectionDuration = millis() - sectionStartTime;
+        if (sectionDuration > 1000) {
+            LOG_WARN(TAG_TASK, "⚠️  checkHeartBreat() took %lums (>1s)", sectionDuration);
+        }
 
         // Handle BLE command sequence (tare, start timer, etc.)
+        sectionStartTime = millis();
         handleBLESequence();
+        sectionDuration = millis() - sectionStartTime;
+        if (sectionDuration > 1000) {
+            LOG_WARN(TAG_TASK, "⚠️  handleBLESequence() took %lums (>1s)", sectionDuration);
+        }
 
         // Update weight readings
         updateScaleReadings();
@@ -2528,16 +3073,39 @@ void loop()
     lastMainWDTLog = now;
   }
 
-  // DIAGNOSTIC: Log main loop heartbeat every 10 seconds to detect freezes
+  // ===== DIAGNOSTIC: Core 1 Loop Heartbeat =====
+  // Track loop iteration frequency to detect if Core 1 is freezing
   static unsigned long lastLoopLog = 0;
-  if (millis() - lastLoopLog > 10000) {
-    LOG_DEBUG(TAG_TASK, "Main loop heartbeat (Core 1 alive)");
+  static uint32_t loopIterationCount = 0;
+  loopIterationCount++;
+
+  if (millis() - lastLoopLog > 5000) {  // Every 5 seconds
+    LOG_DEBUG(TAG_TASK, "💓 Core 1 loop() alive: %lu iterations in 5s (~%lu Hz)",
+              loopIterationCount, loopIterationCount / 5);
+    loopIterationCount = 0;
     lastLoopLog = millis();
   }
+  // ===== END CORE 1 LOOP HEARTBEAT =====
 
   // ========================================================================
   // UI OPERATIONS ONLY - All BLE operations moved to BLE task on Core 0!
   // ========================================================================
+
+  // CRITICAL FIX: Process UI updates BEFORE LVGL timer handler to prevent race condition
+  // If processUIUpdates() runs AFTER LVGLTimerHandlerRoutine(), it can modify LVGL objects
+  // while LVGL timers are still accessing them → NULL pointer crash in lv_timer.c:107
+  // See crash at 101s runtime: LoadProhibited at EXCVADDR 0x00000014 (NULL+offset)
+  processUIUpdates();
+
+  // CRITICAL: Manage display refresh rate based on shot state (Core 1 only - safe)
+  // Previously called from Core 0 (BLE task) → LVGL race condition → crashes
+  // Now polled by Core 1 at 242 Hz → state change detected within 4ms
+  // SAFETY: Initialize to match shot.brewing to prevent spurious call on first loop
+  static bool lastBrewingState = shot.brewing;
+  if (shot.brewing != lastBrewingState) {
+    updateDisplayRefreshRate(shot.brewing);
+    lastBrewingState = shot.brewing;
+  }
 
   // LVGL UI updates (CRITICAL - must run frequently)
   LVGLTimerHandlerRoutine();
@@ -2549,9 +3117,6 @@ void loop()
               displayAsleep, mainLoopWDTResets, bleTaskWDTResets);
     lastLVGLLog = millis();
   }
-
-  // Process queued UI updates from BLE task (professional thread-safe pattern)
-  processUIUpdates();
 
   // Update connection status from BLE task (polls shared memory)
   updateUIWithBLEData();

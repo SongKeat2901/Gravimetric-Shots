@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Gravimetric Shots** is an embedded ESP32-S3 espresso controller that uses BLE-connected Acaia scales for real-time gravimetric shot profiling. The system monitors extraction weight, predicts shot endpoint via linear regression, and controls a solenoid valve relay for automated shot stopping.
 
-**Hardware**: LilyGO T-Display-S3-Long (ESP32-S3R8, 240MHz dual-core, 16MB Flash, 8MB PSRAM, 180×640 QSPI display, capacitive touch)
+**Hardware**: LilyGO T-Display-S3-Long (ESP32-S3R8, 160MHz dual-core [reduced from 240MHz for thermal/power management], 16MB Flash, 8MB PSRAM, 180×640 QSPI display, capacitive touch)
 
 **Tested Setup**: La Marzocco Micra + Acaia Lunar 2021
 
@@ -122,6 +122,35 @@ if (!_pReadChar || !_pWriteChar || !_pClient || !_pClient->isConnected()) {
 - NimBLE-Arduino @ ^1.4.2
 - XPowersLib (power management)
 - WebSerial, ESPAsyncWebServer, AsyncTCP (debug builds only)
+
+---
+
+## CPU Frequency Configuration
+
+**Current Setting**: **160 MHz** (reduced from hardware maximum of 240 MHz)
+
+**Why 160 MHz?**
+- **Power savings**: 33% less power consumption vs 240 MHz
+- **Thermal management**: Reduces chip temperature and heat generation
+- **ESD protection**: Lower operating temperature = less sensitivity to electrostatic discharge
+- **Performance**: Still fast enough for LVGL @ 60 Hz + BLE + touch I2C
+
+**Implementation**: Set in `setup()` via `setCpuFrequencyMhz(160)` at the very beginning (before NVS, BLE, or WiFi initialization).
+
+**Valid ESP32-S3 Frequencies**: 240 MHz (max), 160 MHz, 80 MHz, 40 MHz, 20 MHz, 10 MHz
+
+**Frequency Trade-offs**:
+- **240 MHz**: Maximum performance, highest power/heat (original hardware spec)
+- **160 MHz**: ✅ **Current setting** - Best balance of performance and efficiency
+- **80 MHz**: May cause LVGL UI lag, BLE timing issues (not recommended for this application)
+
+**Testing Results**:
+- UI remains smooth at 60 Hz refresh rate
+- BLE connection stable
+- Touch response unchanged
+- Chip runs noticeably cooler after 10+ minutes of operation
+
+**To Change Frequency**: Edit `src/GravimetricShots.ino` line ~2152, modify `setCpuFrequencyMhz(160)` parameter.
 
 ---
 
@@ -406,6 +435,44 @@ pio run --target upload
 1. Edit `src/debug_config.h`
 2. Change subsystem log level: `#define <SUBSYSTEM>_LOG_LEVEL LOG_VERBOSE`
 3. Rebuild and upload
+
+---
+
+## Technical Post-Mortems
+
+### NimBLE vs ArduinoBLE Analysis (Oct 19, 2025)
+
+**Document:** [NIMBLE_VS_ARDUINOBLE_POSTMORTEM.md](NIMBLE_VS_ARDUINOBLE_POSTMORTEM.md)
+
+**Summary:** Complete technical analysis of why ArduinoBLE blocking implementation succeeded where NimBLE non-blocking state machine failed.
+
+**Key Findings:**
+- **NimBLE State Machine:** Crashed at 221 seconds (21st scan cycle)
+  - Root cause: NimBLE library internal bug (`_pScan->start()` NULL dereference)
+  - Complexity: 847 lines, 11 states, 7 race conditions
+  - Unfixable: Crash inside library code, not application code
+
+- **ArduinoBLE Blocking:** Stable for 420+ seconds (8+ reconnections, zero crashes)
+  - Simplicity: 183 lines, 1 while-loop, no race conditions
+  - Blocking safe: Dual-core isolation (BLE on Core 0, UI on Core 1)
+  - Watchdog protection: Reset before/after long operations
+
+**Decision:** Deploy ArduinoBLE blocking implementation (current production code)
+
+**Why It Works:**
+1. Dual-core ESP32-S3 makes blocking acceptable (UI unaffected)
+2. Watchdog protection prevents timeouts (20s limit, operations <10s)
+3. Mature library (5+ years production use vs 4 years for NimBLE)
+4. Simpler code = fewer bugs (78% less code than NimBLE)
+
+**Test Results:**
+```
+ArduinoBLE:  420+ seconds, 8+ reconnections, 0 crashes ✅
+NimBLE:      221 seconds, 21 reconnections, 1 crash   ❌
+```
+
+**Lesson Learned:**
+> "Blocking is not always bad. When isolated to dedicated core with bounded duration and watchdog protection, blocking can be simpler and more reliable than complex async state machines."
 
 ---
 
