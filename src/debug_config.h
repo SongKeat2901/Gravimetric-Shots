@@ -101,10 +101,11 @@ typedef enum {
 #define LOG_LEVEL_TASK    LOG_DEBUG   // Task heartbeats
 #define LOG_LEVEL_BLE     LOG_DEBUG   // BLE operations
 #define LOG_LEVEL_SCALE   LOG_DEBUG   // Scale communication
-#define LOG_LEVEL_UI      LOG_DEBUG   // UI/LVGL updates
+#define LOG_LEVEL_UI      LOG_INFO    // UI/LVGL updates (INFO = hide touch I2C debug data)
 #define LOG_LEVEL_RELAY   LOG_DEBUG   // Relay control
 #define LOG_LEVEL_WEIGHT  LOG_DEBUG   // Weight updates
 #define LOG_LEVEL_LCD_DMA LOG_INFO    // Display DMA operations (lcd_PushColors calls)
+#define LOG_LEVEL_SHOT    LOG_VERBOSE // Shot weight data (enables real-time weight logging)
 
 // ANSI color codes (prefixed with GS_ to avoid ESP-IDF conflicts)
 #define GS_COLOR_BLACK   "30"
@@ -147,6 +148,9 @@ inline log_level_t get_tag_log_level(const char* tag) {
 #endif
 #ifdef LOG_LEVEL_LCD_DMA
     if (strcasecmp(tag, "LCD_DMA") == 0) return LOG_LEVEL_LCD_DMA;
+#endif
+#ifdef LOG_LEVEL_SHOT
+    if (strcasecmp(tag, "Shot") == 0) return LOG_LEVEL_SHOT;
 #endif
 
     // Default to global level for unknown tags

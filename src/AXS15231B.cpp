@@ -346,9 +346,10 @@ void lcd_PushColors(uint16_t x,
 
         if(data != NULL && (width != 0) && (high != 0))
         {
-            // DIAGNOSTIC: Log entry to DMA lcd_PushColors with details
-            LOG_INFO("LCD_DMA", "🖼️  Push #%lu: (%d,%d) %dx%d = %d pixels",
-                     dma_push_count, x, y, width, high, width*high);
+            // DIAGNOSTIC: Log only first 10 DMA pushes for initial debugging
+            // (Disabled to reduce log spam - uncomment if debugging display issues)
+            // LOG_DEBUG("LCD_DMA", "🖼️  Push #%lu: (%d,%d) %dx%d = %d pixels",
+            //          dma_push_count, x, y, width, high, width*high);
             if (dma_push_count <= 10) {  // Only log pixel data for first 10 pushes
                 LOG_DEBUG("LCD_DMA", "   First 4 pixels: [0]=0x%04X [1]=0x%04X [2]=0x%04X [3]=0x%04X",
                           data[0], data[1], data[2], data[3]);

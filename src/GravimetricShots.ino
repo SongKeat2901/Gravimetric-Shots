@@ -29,10 +29,9 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <ui.h>
-#include <AcaiaArduinoBLE.h>  // Now uses NimBLE internally
-#include "NimBLEDevice.h"      // NimBLE for WiFi+BLE coexistence
+#include <AcaiaArduinoBLE.h>  // ArduinoBLE-based scale connection
 #include "esp_task_wdt.h"      // Task watchdog for auto-recovery from hangs
-#include "nvs_flash.h"         // NVS initialization for WiFi+BLE coexistence
+#include "nvs_flash.h"         // NVS initialization (needed for BLE storage)
 #include <Preferences.h>
 #include <cstring>
 
@@ -273,9 +272,10 @@ struct Shot
 Shot shot;
 
 // NimBLE Server objects (for advertising weight to external devices - optional)
-NimBLEServer* pServer = nullptr;
-NimBLEService* pWeightService = nullptr;
-NimBLECharacteristic* pWeightCharacteristic = nullptr;
+// DISABLED: Removed NimBLE server functionality (reverted to ArduinoBLE for stability)
+// NimBLEServer* pServer = nullptr;
+// NimBLEService* pWeightService = nullptr;
+// NimBLECharacteristic* pWeightCharacteristic = nullptr;
 
 bool firstConnectionNotificationPending = true;
 bool BatteryLow                         = false;
@@ -301,9 +301,8 @@ const char *BRIGHTNESS_KEY = "brightness";
 bool lastScaleConnected      = false;
 bool hasEverConnectedToScale = false;
 bool hasShownNoScaleMessage  = false;
-// CRITICAL: Must be >= BLE scan timeout (10s) + margin to prevent overlapping scans
-// Overlapping scans corrupt NimBLE stack and cause system reboot at ~30 seconds
-constexpr uint32_t SCALE_INIT_RETRY_MS = 12000;  // 10s scan timeout + 2s cleanup margin
+// CRITICAL: Must be >= BLE scan timeout (1s ArduinoBLE) + margin to prevent overlapping scans
+constexpr uint32_t SCALE_INIT_RETRY_MS = 2000;  // 1s scan timeout + 1s cleanup margin
 constexpr uint32_t FLUSH_STATUS_HOLD_MS = 2000;
 uint32_t lastScaleInitAttempt          = 0;
 char pendingScaleStatus[64] = {0};  // Fixed buffer - eliminates heap fragmentation
@@ -539,7 +538,7 @@ static void handleBLESequence()
         bleSequenceState = BLE_IDLE;
         bleSequenceInProgress = false;
         shot.brewing = false;
-        scale.setIsBrewing(false);
+        // scale.setIsBrewing(false);  // ArduinoBLE doesn't have this method
         isFlushing = false;
         return;
       }
@@ -568,7 +567,7 @@ static void handleBLESequence()
         bleSequenceState = BLE_IDLE;
         bleSequenceInProgress = false;
         shot.brewing = false;
-        scale.setIsBrewing(false);
+        // scale.setIsBrewing(false);  // ArduinoBLE doesn't have this method
         isFlushing = false;
         return;
       }
@@ -592,7 +591,7 @@ static void handleBLESequence()
         bleSequenceState = BLE_IDLE;
         bleSequenceInProgress = false;
         shot.brewing = false;
-        scale.setIsBrewing(false);
+        // scale.setIsBrewing(false);  // ArduinoBLE doesn't have this method
         isFlushing = false;
         return;
       }
@@ -615,7 +614,7 @@ static void handleBLESequence()
       updateDisplayRefreshRate(true);   // 60Hz display mode
 
       // Enable weight logging during shots
-      scale.setIsBrewing(true);
+      // scale.setIsBrewing(true);  // ArduinoBLE doesn't have this method
 
       bleSequenceState = BLE_IDLE;
       LOG_INFO(TAG_SHOT, "Shot started successfully!");
@@ -638,7 +637,7 @@ static void setBrewingState(bool brewing)
     {
       queueScaleStatus("Scale not connected");
       shot.brewing = false;
-      scale.setIsBrewing(false);
+      // scale.setIsBrewing(false);  // ArduinoBLE doesn't have this method
       isFlushing   = false;
       return;
     }
@@ -677,7 +676,7 @@ static void stopBrew(bool setDefaultStatus, ShotEndReason reason = USER_STOPPED)
   updateDisplayRefreshRate(false);  // Switch back to normal refresh (30Hz) when stopped
 
   // Disable weight logging (return to silent idle mode)
-  scale.setIsBrewing(false);
+  // scale.setIsBrewing(false);  // ArduinoBLE doesn't have this method
 
   if (setDefaultStatus && wasBrewing)
   {
@@ -1507,15 +1506,14 @@ void checkScaleStatus()
 
     lastScaleConnected = false;
 
-    // Non-blocking connection state machine
-    // NOTE: scale.update() is now called in bleTaskFunction main loop
-    // This function only handles init retry logic
-    if (!scale.isConnecting())
+    // ArduinoBLE: init() is blocking (with LVGL keepalive inside), safe on Core 0
+    // Retry logic ensures we don't spam connection attempts
+    if (!scale.isConnected())
     {
-      // Not currently connecting, can start new attempt
+      // Not currently connected, can start new attempt
       if (!isFlushing && ((now - lastScaleInitAttempt) >= SCALE_INIT_RETRY_MS || lastScaleInitAttempt == 0))
       {
-        scale.init();  // Starts state machine, returns immediately
+        scale.init();  // Blocking call (1s timeout), but runs on Core 0 so UI on Core 1 is unaffected
         lastScaleInitAttempt = now;
       }
     }
@@ -1534,9 +1532,9 @@ void checkScaleStatus()
   {
     // UI updates removed - handled by updateUIWithBLEData() on Core 1
 
-    // CRITICAL FIX: Only show "connected" if FULLY connected, not just mid-handshake
-    // Prevents false "Scale Connected" messages during connection failures
-    if (!lastScaleConnected && scale.getConnectionState() == CONN_CONNECTED)
+    // ArduinoBLE: isConnected() already means fully connected (init() succeeded)
+    // No need to check connection state - if init() returned true, we're fully connected
+    if (!lastScaleConnected)
     {
       queueScaleStatus("Scale Connected");
     }
@@ -1616,9 +1614,10 @@ static void processPendingStatusQueue()
 
 static void updateScaleReadings()
 {
-  // Check newWeightAvailable FIRST - it detects timeouts and updates connection state
-  // Then check isConnected to see if we should process the weight
-  if (!scale.newWeightAvailable() || !scale.isConnected())
+  // CRITICAL: Check isConnected FIRST to prevent reading uninitialized BLE characteristics
+  // C++ short-circuit evaluation: if isConnected() is false, newWeightAvailable() won't be called
+  // Bug fix: Calling newWeightAvailable() when disconnected causes LoadProhibited crash
+  if (!scale.isConnected() || !scale.newWeightAvailable())
     return;
 
   currentWeight = scale.getWeight();
@@ -1904,11 +1903,15 @@ void setup()
   Serial.println();
   Serial.flush();  // Force USB CDC to send immediately
 
-  // Step 3: Initialize NimBLE BEFORE WiFi (critical for radio coexistence)
+  // Step 3: Initialize ArduinoBLE (creates HCI stream buffers for BLE communication)
   LOG_INFO(TAG_SYS, "");
-  LOG_INFO(TAG_SYS, "=== Initializing NimBLE (BEFORE WiFi) ===");
-  NimBLEDevice::init("GravimetricShots");
-  LOG_INFO(TAG_SYS, "NimBLE initialized - radio claimed by BLE stack");
+  LOG_INFO(TAG_SYS, "=== Initializing ArduinoBLE ===");
+  if (!BLE.begin()) {
+    LOG_ERROR(TAG_SYS, "❌ ArduinoBLE initialization failed!");
+    LOG_ERROR(TAG_SYS, "System halted - BLE init is critical for scale connection");
+    while(1) delay(1000);  // Halt - BLE init failure is unrecoverable
+  }
+  LOG_INFO(TAG_SYS, "✅ ArduinoBLE initialized - HCI stream buffers ready");
 
   // BACKUP: Log reset reason again via LOG_ERROR (in case raw Serial was missed)
   // This provides redundancy if USB CDC wasn't connected during early boot
@@ -1936,10 +1939,13 @@ void setup()
     LOG_WARN(TAG_SYS, "PMU init failed (LED control unavailable)");
   }
 
-  // Initialize task watchdog (10 second timeout) - auto-reboot on hang
-  esp_task_wdt_init(10, true);  // 10s timeout, panic & reboot on trigger
+  // Initialize task watchdog (20 second timeout) - auto-reboot on hang
+  // CRITICAL: Increased from 10s to 20s to accommodate BLE discovery delays
+  // peripheral.discoverAttributes() can take 1-10+ seconds during reconnection
+  // 20s provides safety margin while still catching real freezes
+  esp_task_wdt_init(20, true);  // 20s timeout, panic & reboot on trigger
   esp_task_wdt_add(NULL);       // Add current task to watchdog
-  LOG_INFO(TAG_SYS, "Task watchdog enabled (10s timeout)");
+  LOG_INFO(TAG_SYS, "Task watchdog enabled (20s timeout)");
 
   preferences.begin("myApp", false);                       // Open the preferences with a namespace and read-only flag
   brightness = preferences.getInt(BRIGHTNESS_KEY, 0);      // Read the brightness value from preferences
@@ -1975,28 +1981,29 @@ void setup()
   relayState = true; // force update on first set
   setRelayState(false);
 
-  // NimBLE already initialized early in setup() (before WiFi)
-  // Create BLE server to advertise weight to external devices (optional)
-  LOG_DEBUG(TAG_SYS, "Creating NimBLE server for weight advertising...");
-  pServer = NimBLEDevice::createServer();
-  if (pServer) {
-    pWeightService = pServer->createService("00002a98-0000-1000-8000-00805f9b34fb");
-    if (pWeightService) {
-      pWeightCharacteristic = pWeightService->createCharacteristic(
-        "0x2A98",
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE
-      );
-      if (pWeightCharacteristic) {
-        uint8_t initialValue = 36;
-        pWeightCharacteristic->setValue(&initialValue, 1);
-      }
-      pWeightService->start();
-    }
-    NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID("00002a98-0000-1000-8000-00805f9b34fb");
-    pAdvertising->start();
-    LOG_INFO(TAG_SYS, "NimBLE server ready");
-  }
+  // NimBLE server functionality DISABLED (reverted to ArduinoBLE for stability)
+  // Weight advertising to external devices is optional - not essential for core functionality
+  LOG_DEBUG(TAG_SYS, "NimBLE server disabled (ArduinoBLE mode)");
+  // COMMENTED OUT: NimBLE server code removed for ArduinoBLE compatibility
+  // pServer = NimBLEDevice::createServer();
+  // if (pServer) {
+  //   pWeightService = pServer->createService("00002a98-0000-1000-8000-00805f9b34fb");
+  //   if (pWeightService) {
+  //     pWeightCharacteristic = pWeightService->createCharacteristic(
+  //       "0x2A98",
+  //       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE
+  //     );
+  //     if (pWeightCharacteristic) {
+  //       uint8_t initialValue = 36;
+  //       pWeightCharacteristic->setValue(&initialValue, 1);
+  //     }
+  //     pWeightService->start();
+  //   }
+  //   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  //   pAdvertising->addServiceUUID("00002a98-0000-1000-8000-00805f9b34fb");
+  //   pAdvertising->start();
+  //   LOG_INFO(TAG_SYS, "NimBLE server ready");
+  // }
 
   pinMode(TOUCH_RES, OUTPUT);
   digitalWrite(TOUCH_RES, HIGH);
@@ -2429,9 +2436,8 @@ void bleTaskFunction(void* parameter)
         }
 
         // CRITICAL FIX: Always call update() to drive state machine
-        // This must be called every loop iteration, not just when connecting
-        // Without this, scan timeouts don't transition properly and watchdog triggers
-        scale.update();
+        // ArduinoBLE doesn't have update() - init() is blocking, no state machine
+        // scale.update();  // Not needed for ArduinoBLE
 
         // Check scale status and manage connection
         checkScaleStatus();
@@ -2452,7 +2458,8 @@ void bleTaskFunction(void* parameter)
         handleShotWatchdogs();
 
         // Update shared data for main loop
-        updateSharedConnectionStatus(scale.isConnected(), scale.isConnecting());
+        // ArduinoBLE doesn't have isConnecting() - always false (blocking connection)
+        updateSharedConnectionStatus(scale.isConnected(), false);
         updateSharedWeight(currentWeight);
 
         // Monitor BLE task stack usage every 10 seconds (detect stack overflow)
